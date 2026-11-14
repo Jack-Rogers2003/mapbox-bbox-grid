@@ -2,6 +2,9 @@ export type { CreateGridOptions } from "./core/create-grid";
 export { createGrid } from "./core/create-grid";
 export { BBoxGrid } from "./core/grid";
 export type {
+  GeoTransform,
+  GeoTransformGridDefinition,
+  GeoTransformGridSource,
   ProjectedBoundsGridOptions,
   ProjectedCellIndex,
   ProjectedGridOptions,
@@ -9,12 +12,24 @@ export type {
 export {
   createProjectedGrid,
   createProjectedGridFromBounds,
+  fromGeoTransform,
   projectedCellAt,
 } from "./core/projected-grid";
+export type {
+  ProjectedGridWorker,
+  ProjectedGridWorkerErrorHandler,
+  ProjectedGridWorkerMessageEvent,
+  ProjectedGridWorkerScope,
+} from "./core/projected-grid-worker";
+export { installProjectedGridWorker } from "./core/projected-grid-worker";
 export { GridError } from "./errors";
 export { addBBoxGrid } from "./map/add-bbox-grid";
-export type { AddProjectedGridOptions, ProjectedGridOverlayHandle } from "./map/add-projected-grid";
-export { addProjectedGrid } from "./map/add-projected-grid";
+export type {
+  AddProjectedGridOptions,
+  ProjectedGridOverlayHandle,
+  TilePixelGridOptions,
+} from "./map/add-projected-grid";
+export { addProjectedGrid, addTilePixelGrid } from "./map/add-projected-grid";
 export type {
   AddGridOptions,
   AddGridSettings,

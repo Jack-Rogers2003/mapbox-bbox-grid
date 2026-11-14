@@ -1,9 +1,9 @@
 # mapbox-bbox-grid
 
-Give it a bounding box and a resolution; it builds GeoJSON **LineStrings** for the grid cells and draws them on a **Mapbox GL JS** map. TypeScript, ESM + CommonJS. `proj4` is a runtime dependency for projected grids; Mapbox GL JS is an optional peer dependency.
+Give it a bounding box and a resolution; it builds GeoJSON line grids and draws them on a **Mapbox GL JS** map. TypeScript, ESM + CommonJS. `proj4` is a runtime dependency for projected grids; Mapbox GL JS is an optional peer dependency.
 
 ```bash
-pnpm add mapbox-bbox-grid     # or: npm install / yarn add
+pnpm add @jack_rogers/mapbox-bbox-grid     # or: npm install / yarn add
 # mapbox-gl is an optional peer dependency: you already have it if you use Mapbox
 ```
 
@@ -11,7 +11,7 @@ pnpm add mapbox-bbox-grid     # or: npm install / yarn add
 
 ```ts
 import mapboxgl from "mapbox-gl";
-import { addBBoxGrid } from "mapbox-bbox-grid";
+import { addBBoxGrid } from "@jack_rogers/mapbox-bbox-grid";
 
 const map = new mapboxgl.Map({ container: "map", accessToken: "pk.YOUR_TOKEN" });
 
@@ -25,6 +25,8 @@ const grid = addBBoxGrid(map, {
 });
 
 grid.update({ resolution: 1 }); // redraw
+grid.hide(); // hide without rebuilding
+grid.show();
 grid.remove(); // remove layer, source and listeners
 ```
 
@@ -33,13 +35,15 @@ Safe to call before the map's style has loaded; it waits for `load`.
 ## Just the GeoJSON
 
 ```ts
-import { createGrid, BBoxGrid } from "mapbox-bbox-grid";
+import { createGrid, BBoxGrid } from "@jack_rogers/mapbox-bbox-grid";
 import {
   addProjectedGrid,
   createProjectedGrid,
   createProjectedGridFromBounds,
   projectedCellAt,
-} from "mapbox-bbox-grid";
+  addTilePixelGrid,
+  fromGeoTransform,
+} from "@jack_rogers/mapbox-bbox-grid";
 
 createGrid([-2.7, 51.4, -2.5, 51.5], { resolution: 0.05 }); // one LineString per grid line
 createGrid([-2.7, 51.4, -2.5, 51.5], { resolution: 0.05, mode: "cells" }); // one closed ring per cell, with row/col
@@ -76,29 +80,31 @@ const grid = addProjectedGrid(
     crs: "EPSG:32631",
     resolution: 500, // native CRS units (metres for EPSG:32631)
     origin: [0, 0], // use the chart's actual grid origin
-    maxSegmentLength: 20_000,
+    viewport: { padding: 0.2, maxLines: 1500 },
   },
 );
 
+grid.update({ paint: { "line-color": "#f80" }, beforeId: "place-labels" });
+grid.hide();
+grid.show();
 grid.remove();
 ```
 
-For a custom CRS, register its Proj4 definition before calling the API, or pass the definition
-string as `crs`. `proj4` is an external runtime dependency so CRS definitions and grid-shift files
-registered through Proj4js are available to the library:
+For a custom CRS, pass the Proj4 definition string as `crs`. This avoids relying on Proj4js
+registration being shared when an application and this package bundle separate copies of `proj4`:
 
 ```ts
-import proj4 from "proj4";
-
-proj4.defs("CHART:LOCAL", "+proj=... +units=m +no_defs");
+const chartCrs =
+  "+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996 +x_0=400000 +y_0=-100000 +ellps=airy +units=m +no_defs";
 const grid = addProjectedGrid(map, chartBounds, {
-  crs: "CHART:LOCAL",
+  crs: chartCrs,
   resolution: 500,
 });
 ```
 
-CRS bounds must be projected and use supported linear units. Datum-transformation accuracy depends
-on the selected CRS definition and available transformation grids; the library does not
+CRS bounds must be projected and use supported linear units. Definitions and any required
+datum-shift grids must be available to the Proj4js instance used by the package.
+Datum-transformation accuracy depends on the selected CRS definition and available transformation grids; the library does not
 automatically download CRS databases or datum grids. Mapbox/MapLibre renders the result in Web
 Mercator, so a grid may look curved on screen even though it is straight and aligned in the chart
 CRS.
@@ -114,21 +120,55 @@ CRS.
 | `cells`                                    | instead of `resolution`: `[cols, rows]` or one number                                                                                                       |
 | `mode`                                     | `"lines"` (default, efficient) or `"cells"` (per-cell properties)                                                                                           |
 | `viewport`                                 | `true` or `{ padding, maxLines }`: draw only the visible area, thinned when zoomed out                                                                      |
-| `id`, `paint`, `layout`, `beforeId`, `fit` | layer id, styling, layer order, fit-to-bbox                                                                                                                 |
+| `id`, `paint`, `layout`, `beforeId`, `minzoom`, `maxzoom`, `slot`, `fit` | layer id, styling, layer order, zoom range, Standard style slot, fit-to-bbox |
 | `maxCells`                                 | optional safety limit on cell count for full-grid output; unset by default and not applied in viewport mode                                                  |
 
 TypeScript callers must specify exactly one of `resolution` or `cells`. The bounding box is a four-number tuple, and viewport mode cannot be combined with cell mode. Runtime validation remains for invalid numeric values and untyped JavaScript callers.
 
-`createGrid` and `addBBoxGrid` create longitude/latitude grids; their metric `units` option converts metres at the bbox's centre latitude and is only an approximation. For a WGS84 geographic bbox with a projected grid, use `createProjectedGrid`. For chart bounds already expressed in the chart CRS, use `createProjectedGridFromBounds` or `addProjectedGrid`, with bounds ordered `[minX, minY, maxX, maxY]`. These chart-bounds APIs align to resolution multiples in the CRS's native linear units, from `[0, 0]` by default; provide the chart's `origin` if it differs. Line features include `axis` and integer `index` properties. Use `projectedCellAt` with the same CRS, resolution and origin to look up a point's `{ col, row }`; points exactly on a grid line belong to the positive x/y side. Output coordinates are transformed back to WGS84 for Mapbox GeoJSON.
+`createGrid` and `addBBoxGrid` create longitude/latitude grids; their metric `units` option converts metres at the bbox's centre latitude and is only an approximation. For a WGS84 geographic bbox with a projected grid, use `createProjectedGrid`. For chart bounds already expressed in the chart CRS, use `createProjectedGridFromBounds` or `addProjectedGrid`, with bounds ordered `[minX, minY, maxX, maxY]`. These chart-bounds APIs align to resolution multiples in the CRS's native linear units, from `[0, 0]` by default; provide a non-zero `origin` when the chart's grid uses another anchor. Projected output contains one MultiLineString feature per axis, with an `indices` array parallel to its line components. Use `projectedCellAt` with the same CRS, resolution and origin to look up a point's `{ col, row }`; points exactly on a grid line belong to the positive x/y side. Output coordinates are transformed back to WGS84 for Mapbox GeoJSON.
+
+For raster data, pass its GDAL transform and `[rows, columns]` shape directly. `fromGeoTransform` is also available when you need the derived bounds, origin and pixel resolution separately. Rotated affine transforms are not supported by this axis-aligned grid API.
+
+```ts
+const rasterGrid = addProjectedGrid(
+  map,
+  { affine_transform: [400000, 20, 0, 200000, 0, -20], shape: [5000, 6000] },
+  { crs: "EPSG:27700" }, // origin and pixel spacing come from the transform
+);
+
+// For EPSG:3857 bounds, draw a grid at one pixel per tile pixel:
+const pixelGrid = addTilePixelGrid(map, mercatorBounds, { zoom: 12, tileSize: 256 });
+```
+
+For very large grids, provide a module worker and install the package's handler in its entrypoint.
+Generation runs in the worker; layer updates still happen on the main thread. The worker remains
+owned by the caller.
+
+```ts
+// projected-grid.worker.ts
+import { installProjectedGridWorker } from "@jack_rogers/mapbox-bbox-grid";
+installProjectedGridWorker(self);
+
+// app.ts
+const worker = new Worker(new URL("./projected-grid.worker.ts", import.meta.url), { type: "module" });
+const grid = addProjectedGrid(map, chartBounds, {
+  crs: "EPSG:32631",
+  resolution: 20,
+  viewport: true,
+  worker,
+  onWorkerError: (error) => console.error(error),
+});
+```
 
 ## Performance
 
-- Use `mode: "lines"` (the default) for visuals. It creates one feature per grid line instead of one per cell.
+- Use `mode: "lines"` (the default) for visuals. Geographic grids create one feature per grid line; projected grids group lines into one MultiLineString feature per axis.
 - For large areas or fine resolutions turn on `viewport: true`. It finds visible line indices directly from the grid steps, without creating or retaining tick arrays for the full bbox. Only visible lines (plus padding) are generated; after a pan/zoom, the source is updated on `moveend`. When more than `maxLines` (default 1000) would be visible, every n-th line is drawn instead. Lines stay on the real grid and never shift while panning. This works with `lines` mode only.
 - In viewport mode, memory and GeoJSON work are proportional to the displayed lines rather than the total grid size. `maxLines` is a target; bbox border lines can add a small number beyond it.
 - The grid dimensions (`cols`, `rows`, `cellCount`) are inexpensive to read. Accessing `xs`/`ys`, or requesting full output with `lines()`, `cells()`, `createGrid()` or `toGeoJSON()`, materializes or returns the entire grid. Those APIs can use substantial time and memory for fine resolutions or large extents. Use viewport mode for map display and set `maxCells` when producing full-grid output.
 - Cell mode creates one feature per cell with duplicated shared edges, so avoid it for large grids unless per-cell properties are needed. A `maxCells` limit applies to full-grid generation, not viewport rendering.
-- `addProjectedGrid` draws the full chart grid; it does not viewport-filter or thin lines. Its `maxLines` limit defaults to 15,000. Large areas at fine resolutions can create large GeoJSON sources and may be slow on low-spec devices.
+- `addProjectedGrid` accepts `viewport: true` or `{ padding, maxLines }` to generate visible lines only. It refreshes on `moveend`, skips unchanged snapped views, and thins by whole multiples of the resolution, so lines remain on the original CRS grid. Its optional top-level `maxLines` limits full-grid output; viewport mode uses its own `viewport.maxLines` as a thinning target instead of failing.
+- Grid transforms are cached for viewport refreshes. EPSG:3857 lines use two vertices by default; other projected grids densify curved lines for display. `addTilePixelGrid` derives the EPSG:3857 origin and pixel spacing from zoom and tile size.
 - Default line width and opacity fade with zoom so far-out views stay light.
 
 ## Notes

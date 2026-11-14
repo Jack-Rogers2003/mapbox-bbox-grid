@@ -12,7 +12,14 @@ import type {
   MapLike,
   ViewportOptions,
 } from "../types";
-import { drawGrid, fitToBBox, removeGrid, restyleGrid, whenStyleReady } from "./layer";
+import {
+  drawGrid,
+  fitToBBox,
+  removeGrid,
+  restyleGrid,
+  setGridVisibility,
+  whenStyleReady,
+} from "./layer";
 
 /**
  * Normalise the `viewport` option.
@@ -100,6 +107,9 @@ function styleOf(options: AddGridOptions): LayerStyle {
     paint: { ...DEFAULT_PAINT, ...options.paint },
     layout: { ...DEFAULT_LAYOUT, ...options.layout },
     beforeId: options.beforeId,
+    minzoom: options.minzoom,
+    maxzoom: options.maxzoom,
+    slot: options.slot,
   };
 }
 
@@ -110,6 +120,7 @@ class BBoxGridLayer implements GridHandle {
   private current: BBoxGrid;
   private removed: boolean = false;
   private listening: boolean = false;
+  private visible: boolean = true;
 
   /** Redraws the visible part of the grid when the camera stops moving. */
   private readonly handleMoveEnd = (): void => {
@@ -153,14 +164,21 @@ class BBoxGridLayer implements GridHandle {
     this.options = merged;
     this.current = nextGrid;
     const id = merged.id ?? DEFAULT_LAYER_ID;
-    if (id !== previousId) {
-      removeGrid(this.map, previousId);
-    }
     this.syncListener();
     whenStyleReady(this.map, () => {
+      if (id !== previousId) {
+        removeGrid(this.map, previousId);
+      }
       this.redraw();
-      if (next.paint || next.layout) {
-        restyleGrid(this.map, id, styleOf(merged));
+      if (
+        next.paint ||
+        next.layout ||
+        next.minzoom !== undefined ||
+        next.maxzoom !== undefined ||
+        next.slot !== undefined ||
+        next.beforeId !== undefined
+      ) {
+        restyleGrid(this.map, id, styleOf(merged), next.beforeId !== undefined);
       }
     });
     if (next.fit) {
@@ -175,6 +193,28 @@ class BBoxGridLayer implements GridHandle {
     removeGrid(this.map, this.options.id ?? DEFAULT_LAYER_ID);
   }
 
+  /** Show the layer without rebuilding its source. */
+  public show(): void {
+    if (this.removed) {
+      return;
+    }
+    this.visible = true;
+    whenStyleReady(this.map, () =>
+      setGridVisibility(this.map, this.options.id ?? DEFAULT_LAYER_ID, this.visible),
+    );
+  }
+
+  /** Hide the layer without removing its source. */
+  public hide(): void {
+    if (this.removed) {
+      return;
+    }
+    this.visible = false;
+    whenStyleReady(this.map, () =>
+      setGridVisibility(this.map, this.options.id ?? DEFAULT_LAYER_ID, this.visible),
+    );
+  }
+
   /** Generate the GeoJSON for the current options and send it to the map. */
   private redraw(): void {
     if (this.removed) {
@@ -185,6 +225,9 @@ class BBoxGridLayer implements GridHandle {
       ? this.current.linesInView(boundsToBBox(this.map.getBounds()), viewport)
       : this.current.toGeoJSON(this.options.mode ?? "lines");
     drawGrid(this.map, this.options.id ?? DEFAULT_LAYER_ID, data, styleOf(this.options));
+    if (!this.visible) {
+      setGridVisibility(this.map, this.options.id ?? DEFAULT_LAYER_ID, false);
+    }
   }
 
   /** Subscribe to `moveend` only while viewport mode is on and the layer is not removed. */

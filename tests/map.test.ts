@@ -1,6 +1,20 @@
 import { assert, test } from "vitest";
-import type { AddGridOptions, BBox, LineFeatureCollection, MapLike } from "../src/index";
-import { addBBoxGrid, addProjectedGrid, GridError } from "../src/index";
+import type {
+  AddGridOptions,
+  BBox,
+  LineFeatureCollection,
+  MapLike,
+  ProjectedGridWorkerMessageEvent,
+  ProjectedGridWorkerScope,
+} from "../src/index";
+import {
+  addBBoxGrid,
+  addProjectedGrid,
+  addTilePixelGrid,
+  GridError,
+  installProjectedGridWorker,
+  type ProjectedGridWorker,
+} from "../src/index";
 
 /** A GeoJSON source recorded by the fake map. */
 interface FakeSource {
@@ -51,6 +65,15 @@ function createFakeMap(options: { styleLoaded?: boolean; bounds?: BBox } = {}) {
     setLayoutProperty(_layerId, name) {
       log.push(`setLayoutProperty ${name}`);
     },
+    setLayerZoomRange(_layerId, minzoom, maxzoom) {
+      log.push(`setLayerZoomRange ${minzoom} ${maxzoom}`);
+    },
+    setSlot(_layerId, slot) {
+      log.push(`setSlot ${slot}`);
+    },
+    moveLayer(_id, beforeId) {
+      log.push(`moveLayer ${beforeId}`);
+    },
     isStyleLoaded: () => options.styleLoaded ?? true,
     once(_type, listener) {
       loadListener = listener;
@@ -99,6 +122,36 @@ function dataOf(fake: ReturnType<typeof createFakeMap>, id = "bboxgrid"): LineFe
     throw new Error(`no source ${id}`);
   }
   return source.data;
+}
+
+/** Connect a fake main-thread Worker to the package's worker message handler. */
+function createGridWorker(): ProjectedGridWorker {
+  const workerListeners = new Set<(event: ProjectedGridWorkerMessageEvent) => void>();
+  const scopeListeners = new Set<(event: ProjectedGridWorkerMessageEvent) => void>();
+  const scope: ProjectedGridWorkerScope = {
+    addEventListener(_type, listener) {
+      scopeListeners.add(listener);
+    },
+    postMessage(message) {
+      for (const listener of [...workerListeners]) {
+        listener({ data: message });
+      }
+    },
+  };
+  installProjectedGridWorker(scope);
+  return {
+    postMessage(message) {
+      for (const listener of [...scopeListeners]) {
+        listener({ data: message });
+      }
+    },
+    addEventListener(_type, listener) {
+      workerListeners.add(listener);
+    },
+    removeEventListener(_type, listener) {
+      workerListeners.delete(listener);
+    },
+  };
 }
 
 test("adds a source and a line layer immediately when the style is loaded", () => {
@@ -226,8 +279,103 @@ test("adds and removes a projected grid aligned to chart-CRS bounds", () => {
     crs: "+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy +datum=OSGB36 +units=m +no_defs",
   });
 
-  assert.equal(dataOf(fake).features.length, 10);
+  assert.equal(dataOf(fake).features.length, 2);
   assert.deepEqual(fake.log, ["addSource", "addLayer"]);
   handle.remove();
   assert.equal(fake.layers.size + fake.sources.size, 0);
+});
+
+test("projected viewport grids thin on the origin-aligned lattice and skip unchanged views", () => {
+  const fake = createFakeMap({ bounds: [-1, -1, 1, 1] });
+  const handle = addProjectedGrid(fake.map, [-1_000_000, -1_000_000, 1_000_000, 1_000_000], {
+    crs: "EPSG:3857",
+    resolution: 1000,
+    maxLines: 1,
+    viewport: { padding: 0, maxLines: 10 },
+  });
+  const features = dataOf(fake).features;
+  assert.ok(features.length <= 2);
+  for (const feature of features) {
+    const indices = feature.properties.indices as number[];
+    assert.ok(indices.every((index) => index % 45 === 0));
+    assert.ok(feature.geometry.type === "MultiLineString");
+    if (feature.geometry.type === "MultiLineString") {
+      assert.ok(feature.geometry.coordinates.every((segment) => segment.length === 2));
+    }
+  }
+
+  const updateCount = fake.log.filter((entry) => entry === "setData").length;
+  fake.moveTo([-1, -1, 1, 1]);
+  assert.equal(fake.log.filter((entry) => entry === "setData").length, updateCount);
+  fake.moveTo([10, 10, 12, 12]);
+  assert.equal(fake.log.filter((entry) => entry === "setData").length, updateCount + 1);
+  handle.remove();
+});
+
+test("projected grid handles show, hide and update layer settings in place", () => {
+  const fake = createFakeMap();
+  const handle = addProjectedGrid(fake.map, [-1000, -1000, 1000, 1000], {
+    crs: "EPSG:3857",
+    resolution: 500,
+  });
+  handle.hide();
+  handle.show();
+  handle.update({ paint: { "line-color": "#00f" }, minzoom: 2, maxzoom: 8, slot: "middle" });
+  handle.update({ beforeId: "labels" });
+  assert.ok(fake.log.includes("setLayoutProperty visibility"));
+  assert.ok(fake.log.includes("setLayerZoomRange 2 8"));
+  assert.ok(fake.log.includes("setSlot middle"));
+  assert.ok(fake.log.includes("moveLayer labels"));
+  assert.equal(fake.log.filter((entry) => entry === "setData").length, 0);
+});
+
+test("accepts GDAL transform input and derives raster alignment", () => {
+  const fake = createFakeMap();
+  const handle = addProjectedGrid(
+    fake.map,
+    { affine_transform: [-1000, 200, 0, 2000, 0, -500], shape: [4, 10] },
+    { crs: "EPSG:3857" },
+  );
+  assert.equal(dataOf(fake).features.length, 2);
+  const x = dataOf(fake).features.find((feature) => feature.properties.axis === "x");
+  assert.ok(x && x.geometry.type === "MultiLineString");
+  assert.deepEqual(x.properties.indices, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  handle.remove();
+});
+
+test("tile-pixel helper derives Web Mercator pixel resolution", () => {
+  const fake = createFakeMap();
+  const handle = addTilePixelGrid(
+    fake.map,
+    [-20_037_508.342789244, -20_037_508.342789244, 20_037_508.342789244, 20_037_508.342789244],
+    { zoom: 0 },
+  );
+  const features = dataOf(fake).features;
+  assert.equal(features.length, 2);
+  assert.ok(features.every((feature) => feature.geometry.type === "MultiLineString"));
+  assert.ok(
+    features.every((feature) => {
+      const indices = feature.properties.indices;
+      return (
+        Array.isArray(indices) && indices.length === 257 && indices[0] === 0 && indices[256] === 256
+      );
+    }),
+  );
+  handle.remove();
+});
+
+test("optional worker generates projected viewport lines and refreshes the map source", () => {
+  const fake = createFakeMap({ bounds: [-1, -1, 1, 1] });
+  const worker = createGridWorker();
+  const handle = addProjectedGrid(fake.map, [-1_000_000, -1_000_000, 1_000_000, 1_000_000], {
+    crs: "EPSG:3857",
+    resolution: 1000,
+    viewport: { padding: 0, maxLines: 10 },
+    worker,
+  });
+  assert.equal(dataOf(fake).features.length, 2);
+
+  fake.moveTo([10, 10, 12, 12]);
+  assert.equal(fake.log.filter((entry) => entry === "setData").length, 1);
+  handle.remove();
 });
