@@ -31,6 +31,23 @@ export type {
 } from "./map/add-projected-grid";
 export { addProjectedGrid, addTilePixelGrid } from "./map/add-projected-grid";
 export type {
+  AddBBoxGridTilesOptions,
+  AddProjectedGridTilesOptions,
+  AddVectorGridTileLayerOptions,
+  GridTileGenerator,
+  GridTileHandle,
+  GridTileProtocol,
+  GridTileProtocolHost,
+  GridTileResource,
+  GridTileUpdateOptions,
+} from "./map/grid-tile-protocol";
+export {
+  addVectorGridTileLayer,
+  createBBoxGridTileGenerator,
+  createProjectedGridTileGenerator,
+  installGridTileProtocol,
+} from "./map/grid-tile-protocol";
+export type {
   AddGridOptions,
   AddGridSettings,
   BBox,

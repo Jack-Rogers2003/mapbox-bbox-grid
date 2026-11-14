@@ -109,6 +109,69 @@ automatically download CRS databases or datum grids. Mapbox/MapLibre renders the
 Mercator, so a grid may look curved on screen even though it is straight and aligned in the chart
 CRS.
 
+## On-demand vector tiles
+
+For large grids, generate one MVT per requested XYZ tile instead of sending a full GeoJSON grid to
+the browser. The tile generator works for both geographic and projected grids, and vector tiles
+continue to use Mapbox/MapLibre's normal projection and layer rendering.
+
+```ts
+import {
+  addVectorGridTileLayer,
+  createBBoxGridTileGenerator,
+} from "@jack_rogers/mapbox-bbox-grid";
+
+// On your tile server, create this once and serve its output at /grid/{z}/{x}/{y}.pbf.
+const tileGenerator = createBBoxGridTileGenerator({
+  bbox: [-2.7, 51.4, -2.5, 51.5],
+  resolution: 0.001,
+});
+
+// Example Express route. Return the bytes with the MVT content type.
+app.get("/grid/:z/:x/:y.pbf", (request, response) => {
+  const bytes = tileGenerator.getTile(
+    Number(request.params.z),
+    Number(request.params.x),
+    Number(request.params.y),
+  );
+  response.type("application/vnd.mapbox-vector-tile").send(Buffer.from(bytes));
+});
+
+// In the browser, point Mapbox GL JS at that endpoint.
+const grid = addVectorGridTileLayer(map, "https://example.com/grid/{z}/{x}/{y}.pbf", {
+  id: "bboxgrid",
+  paint: { "line-color": "#0077ff", "line-width": 1 },
+});
+grid.hide();
+grid.show();
+grid.remove();
+```
+
+For projected grids, use `createProjectedGridTileGenerator(bounds, { crs, resolution, origin })`.
+It derives each tile's requested lines in the grid CRS and returns WGS84-aligned vector-tile
+geometry. `maxTileLines` (default 1000) limits/thins lines per tile.
+
+Mapbox GL JS does not expose the custom `addProtocol` hook used by this package's optional
+MapLibre adapter. For Mapbox, serve generated tiles from an HTTP endpoint as above; the library
+provides the generator but does not start a web server. If using MapLibre GL JS, the
+`installGridTileProtocol(maplibregl)` adapter can generate tiles on demand without a separate
+server:
+
+```ts
+import { installGridTileProtocol } from "@jack_rogers/mapbox-bbox-grid";
+
+const tileProtocol = installGridTileProtocol(maplibregl);
+const grid = tileProtocol.addBBoxGrid(map, {
+  bbox: [-2.7, 51.4, -2.5, 51.5],
+  resolution: 0.001,
+});
+// When finished with all grids created by this protocol:
+tileProtocol.remove();
+```
+
+The MapLibre protocol handler generates tile data in the application thread. For lower-spec
+devices, prefer generating tiles on a server and let the map cache the requested tiles.
+
 ## Options
 
 | Option                                     | Meaning                                                                                                                                                     |
@@ -169,6 +232,7 @@ const grid = addProjectedGrid(map, chartBounds, {
 - The grid dimensions (`cols`, `rows`, `cellCount`) are inexpensive to read. Accessing `xs`/`ys`, or requesting full output with `lines()`, `cells()`, `createGrid()` or `toGeoJSON()`, materializes or returns the entire grid. Those APIs can use substantial time and memory for fine resolutions or large extents. Use viewport mode for map display and set `maxCells` when producing full-grid output.
 - Cell mode creates one feature per cell with duplicated shared edges, so avoid it for large grids unless per-cell properties are needed. A `maxCells` limit applies to full-grid generation, not viewport rendering.
 - `addProjectedGrid` accepts `viewport: true` or `{ padding, maxLines }` to generate visible lines only. It refreshes on `moveend`, skips unchanged snapped views, and thins by whole multiples of the resolution, so lines remain on the original CRS grid. Its optional top-level `maxLines` limits full-grid output; viewport mode uses its own `viewport.maxLines` as a thinning target instead of failing.
+- `createBBoxGridTileGenerator` and `createProjectedGridTileGenerator` generate MVT data on demand per XYZ request, with a default cap of 1000 lines per tile. Serve those bytes from an HTTP tile endpoint for Mapbox GL JS; its vector source cache handles repeat tile requests. Tile generation itself still costs CPU on a cache miss, so coarser grids or a server-side cache may be appropriate for very dense grids.
 - Grid transforms are cached for viewport refreshes. EPSG:3857 lines use two vertices by default; other projected grids densify curved lines for display. `addTilePixelGrid` derives the EPSG:3857 origin and pixel spacing from zoom and tile size.
 - The optional worker moves projected GeoJSON generation off the main thread; it does not change Mapbox's GeoJSON source tiling or line-rendering cost. Shader rendering and on-demand vector-tile sources are not provided.
 - Default line width and opacity fade with zoom so far-out views stay light.

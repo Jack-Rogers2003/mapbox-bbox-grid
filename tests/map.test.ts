@@ -2,6 +2,7 @@ import { assert, test } from "vitest";
 import type {
   AddGridOptions,
   BBox,
+  GridTileProtocolHost,
   LineFeatureCollection,
   MapLike,
   ProjectedGridWorkerMessageEvent,
@@ -11,14 +12,20 @@ import {
   addBBoxGrid,
   addProjectedGrid,
   addTilePixelGrid,
+  addVectorGridTileLayer,
+  createBBoxGridTileGenerator,
   GridError,
+  installGridTileProtocol,
   installProjectedGridWorker,
   type ProjectedGridWorker,
 } from "../src/index";
 
 /** A GeoJSON source recorded by the fake map. */
 interface FakeSource {
-  data: LineFeatureCollection;
+  source:
+    | { type: "geojson"; data: LineFeatureCollection }
+    | { type: "vector"; tiles: string[]; minzoom?: number; maxzoom?: number };
+  data?: LineFeatureCollection;
   setData(data: LineFeatureCollection): void;
 }
 
@@ -40,7 +47,8 @@ function createFakeMap(
     addSource(id, source) {
       log.push("addSource");
       sources.set(id, {
-        data: source.data,
+        source,
+        data: source.type === "geojson" ? source.data : undefined,
         setData(data) {
           log.push("setData");
           this.data = data;
@@ -124,10 +132,29 @@ function createFakeMap(
  */
 function dataOf(fake: ReturnType<typeof createFakeMap>, id = "bboxgrid"): LineFeatureCollection {
   const source = fake.sources.get(id);
-  if (!source) {
+  if (!source?.data) {
     throw new Error(`no source ${id}`);
   }
   return source.data;
+}
+
+/** Create a protocol registry that records handlers for test tile requests. */
+function createFakeTileProtocolHost() {
+  const handlers = new Map<
+    string,
+    (request: { url: string }, abortController: AbortController) => Promise<{ data: ArrayBuffer }>
+  >();
+  const removed: string[] = [];
+  const host: GridTileProtocolHost = {
+    addProtocol(protocol, handler) {
+      handlers.set(protocol, handler);
+    },
+    removeProtocol(protocol) {
+      removed.push(protocol);
+      handlers.delete(protocol);
+    },
+  };
+  return { host, handlers, removed };
 }
 
 /** Connect a fake main-thread Worker to the package's worker message handler. */
@@ -414,6 +441,91 @@ test("tile-pixel helper derives Web Mercator pixel resolution", () => {
     }),
   );
   handle.remove();
+});
+
+test("on-demand bbox vector tiles return MVT and remove cleanly", async () => {
+  const fake = createFakeMap();
+  const protocolHost = createFakeTileProtocolHost();
+  const tileProtocol = installGridTileProtocol(protocolHost.host);
+  const handle = tileProtocol.addBBoxGrid(fake.map, {
+    bbox: [0, 0, 1, 1],
+    resolution: 0.5,
+    id: "tile-grid",
+  });
+  const source = fake.sources.get("tile-grid");
+  assert.equal(source?.source.type, "vector");
+  if (source?.source.type !== "vector") {
+    throw new Error("expected a vector tile source");
+  }
+  assert.deepEqual(source.source.tiles, [`${tileProtocol.protocol}://g0/{z}/{x}/{y}.pbf`]);
+  assert.equal(fake.layers.get("tile-grid")?.["source-layer"], "grid");
+
+  const handler = protocolHost.handlers.get(tileProtocol.protocol);
+  if (!handler) {
+    throw new Error("protocol handler missing");
+  }
+  const response = await handler(
+    { url: `${tileProtocol.protocol}://g0/2/2/1.pbf` },
+    new AbortController(),
+  );
+  assert.ok(response.data.byteLength > 0);
+  assert.equal(new Uint8Array(response.data)[0], 0x1a, "MVT starts with a layer field");
+
+  handle.hide();
+  assert.ok(fake.log.includes("setLayoutProperty visibility"));
+  handle.remove();
+  assert.equal(fake.sources.has("tile-grid"), false);
+  assert.equal(fake.layers.has("tile-grid"), false);
+  tileProtocol.remove();
+  assert.deepEqual(protocolHost.removed, [tileProtocol.protocol]);
+});
+
+test("tile generators expose MVT bytes and remote vector sources attach normally", () => {
+  const generator = createBBoxGridTileGenerator({
+    bbox: [0, 0, 1, 1],
+    resolution: 0.5,
+  });
+  const tile = generator.getTile(2, 2, 1);
+  assert.ok(tile.byteLength > 0);
+  assert.equal(new Uint8Array(tile)[0], 0x1a);
+
+  const fake = createFakeMap();
+  const handle = addVectorGridTileLayer(
+    fake.map,
+    "https://tiles.example.test/grid/{z}/{x}/{y}.pbf",
+    { id: "remote-grid", paint: { "line-color": "#f00" } },
+  );
+  const source = fake.sources.get("remote-grid");
+  assert.equal(source?.source.type, "vector");
+  if (source?.source.type !== "vector") {
+    throw new Error("expected a vector tile source");
+  }
+  assert.deepEqual(source.source.tiles, ["https://tiles.example.test/grid/{z}/{x}/{y}.pbf"]);
+  handle.update({ paint: { "line-width": 2 } });
+  assert.ok(fake.log.includes("setPaintProperty line-width"));
+  handle.remove();
+});
+
+test("on-demand projected vector tiles generate CRS-aligned lines", async () => {
+  const fake = createFakeMap();
+  const protocolHost = createFakeTileProtocolHost();
+  const tileProtocol = installGridTileProtocol(protocolHost.host);
+  const handle = tileProtocol.addProjectedGrid(fake.map, [-100_000, -100_000, 100_000, 100_000], {
+    crs: "EPSG:3857",
+    resolution: 20_000,
+    id: "projected-tile-grid",
+  });
+  const handler = protocolHost.handlers.get(tileProtocol.protocol);
+  if (!handler) {
+    throw new Error("protocol handler missing");
+  }
+  const response = await handler(
+    { url: `${tileProtocol.protocol}://g0/0/0/0.pbf` },
+    new AbortController(),
+  );
+  assert.ok(response.data.byteLength > 0);
+  handle.remove();
+  tileProtocol.remove();
 });
 
 test("worker viewport lines use screen-space thinning and refresh the source", () => {
