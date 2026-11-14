@@ -14,7 +14,7 @@
 ## B. Verify locally (do this before every release)
 6. `pnpm install` creates `pnpm-lock.yaml`. Commit it (CI uses `--frozen-lockfile`).
 7. `pnpm lint:fix` once, to let Biome format and sort imports. Commit the result.
-8. `pnpm check` (typecheck + lint + JSDoc check + tests) must pass. Then `pnpm build`.
+8. `pnpm check` (typecheck + lint + tests) must pass. Then `pnpm build`.
 9. `pnpm pack` creates `mapbox-bbox-grid-0.1.0.tgz`; `tar -tzf mapbox-bbox-grid-0.1.0.tgz` should list only
    `package/dist/*`, README.md, LICENSE and package.json.
 10. In a scratch project: `pnpm add /path/to/mapbox-bbox-grid-0.1.0.tgz`, import it, and draw a grid on a real

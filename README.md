@@ -141,7 +141,7 @@ Projected grids use the selected CRS's alignment, not Mapbox's display projectio
 
 ```bash
 pnpm install
-pnpm check     # typecheck (tsc strict) + lint (Biome) + JSDoc check + tests
+pnpm check     # typecheck (tsc strict) + lint (Biome) + tests
 pnpm test      # run tests with Vitest
 pnpm lint:fix  # auto-format and fix lint issues
 pnpm build
