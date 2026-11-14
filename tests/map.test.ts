@@ -457,9 +457,7 @@ test("on-demand bbox vector tiles return MVT and remove cleanly", async () => {
   if (source?.source.type !== "vector") {
     throw new Error("expected a vector tile source");
   }
-  assert.deepEqual(source.source.tiles, [
-    `${tileProtocol.protocol}://g0/{z}/{x}/{y}.pbf`,
-  ]);
+  assert.deepEqual(source.source.tiles, [`${tileProtocol.protocol}://g0/{z}/{x}/{y}.pbf`]);
   assert.equal(fake.layers.get("tile-grid")?.["source-layer"], "grid");
 
   const handler = protocolHost.handlers.get(tileProtocol.protocol);
@@ -502,9 +500,7 @@ test("tile generators expose MVT bytes and remote vector sources attach normally
   if (source?.source.type !== "vector") {
     throw new Error("expected a vector tile source");
   }
-  assert.deepEqual(source.source.tiles, [
-    "https://tiles.example.test/grid/{z}/{x}/{y}.pbf",
-  ]);
+  assert.deepEqual(source.source.tiles, ["https://tiles.example.test/grid/{z}/{x}/{y}.pbf"]);
   handle.update({ paint: { "line-width": 2 } });
   assert.ok(fake.log.includes("setPaintProperty line-width"));
   handle.remove();

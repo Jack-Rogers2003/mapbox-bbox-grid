@@ -27,10 +27,7 @@ const MAX_REQUEST_ZOOM = 30;
 const MAX_MERCATOR_LATITUDE = 85.0511287798066;
 
 type TileGridShape = Omit<GridSettings, "maxCells"> &
-  (
-    | { resolution: Resolution; cells?: undefined }
-    | { cells: CellCounts; resolution?: undefined }
-  );
+  ({ resolution: Resolution; cells?: undefined } | { cells: CellCounts; resolution?: undefined });
 
 /** Options for drawing a bounding-box grid from on-demand vector tiles. */
 export type AddBBoxGridTilesOptions = Omit<AddGridSettings, "maxCells"> &
@@ -169,10 +166,7 @@ function mercatorPoint(point: Point): Point {
   const longitude = point[0];
   const latitude = Math.max(-MAX_MERCATOR_LATITUDE, Math.min(MAX_MERCATOR_LATITUDE, point[1]));
   const sine = Math.sin((latitude * Math.PI) / 180);
-  return [
-    (longitude + 180) / 360,
-    0.5 - Math.log((1 + sine) / (1 - sine)) / (4 * Math.PI),
-  ];
+  return [(longitude + 180) / 360, 0.5 - Math.log((1 + sine) / (1 - sine)) / (4 * Math.PI)];
 }
 
 /** Convert an XYZ tile to its geographic bounds. */
@@ -180,19 +174,13 @@ function tileBounds(z: number, x: number, y: number): BBox {
   const scale = 2 ** z;
   const tileX = ((x % scale) + scale) % scale;
   const buffer = TILE_BUFFER / TILE_EXTENT;
-  const longitude = (coordinate: number): number =>
-    ((tileX + coordinate) / scale) * 360 - 180;
+  const longitude = (coordinate: number): number => ((tileX + coordinate) / scale) * 360 - 180;
   const latitude = (coordinate: number): number => {
     const tileCoordinate = Math.max(0, Math.min(scale, y + coordinate));
     const n = Math.PI - (2 * Math.PI * tileCoordinate) / scale;
     return (Math.atan(Math.sinh(n)) * 180) / Math.PI;
   };
-  return [
-    longitude(-buffer),
-    latitude(1 + buffer),
-    longitude(1 + buffer),
-    latitude(-buffer),
-  ];
+  return [longitude(-buffer), latitude(1 + buffer), longitude(1 + buffer), latitude(-buffer)];
 }
 
 /** Project a geographic line into the requested tile's local MVT extent. */
@@ -256,7 +244,7 @@ function clippedPaths(points: readonly Point[], z: number, x: number, y: number)
       continue;
     }
     const clipped = clipSegment(start, end);
-    if (!clipped || clipped[0][0] === clipped[1][0] && clipped[0][1] === clipped[1][1]) {
+    if (!clipped || (clipped[0][0] === clipped[1][0] && clipped[0][1] === clipped[1][1])) {
       flush();
       continue;
     }
@@ -283,14 +271,13 @@ function encodeLineFeature(paths: readonly Point[][], axisValue: number): number
   let cursorX = 0;
   let cursorY = 0;
   for (const path of paths) {
-    const quantized = path.map(
-      (point): [number, number] => [
-        Math.max(-TILE_BUFFER, Math.min(TILE_EXTENT + TILE_BUFFER, Math.round(point[0]))),
-        Math.max(-TILE_BUFFER, Math.min(TILE_EXTENT + TILE_BUFFER, Math.round(point[1]))),
-      ],
-    );
+    const quantized = path.map((point): [number, number] => [
+      Math.max(-TILE_BUFFER, Math.min(TILE_EXTENT + TILE_BUFFER, Math.round(point[0]))),
+      Math.max(-TILE_BUFFER, Math.min(TILE_EXTENT + TILE_BUFFER, Math.round(point[1]))),
+    ]);
     const unique = quantized.filter(
-      (point, index) => index === 0 || point[0] !== quantized[index - 1][0] || point[1] !== quantized[index - 1][1],
+      (point, index) =>
+        index === 0 || point[0] !== quantized[index - 1][0] || point[1] !== quantized[index - 1][1],
     );
     if (unique.length < 2) {
       continue;
@@ -311,11 +298,7 @@ function encodeLineFeature(paths: readonly Point[][], axisValue: number): number
   if (geometry.length === 0) {
     return [];
   }
-  return [
-    ...bytesField(2, [0, axisValue]),
-    ...integerField(3, 2),
-    ...bytesField(4, geometry),
-  ];
+  return [...bytesField(2, [0, axisValue]), ...integerField(3, 2), ...bytesField(4, geometry)];
 }
 
 /** Encode viewport lines in Mapbox Vector Tile format. */
@@ -335,10 +318,9 @@ function encodeTile(data: LineFeatureCollection, z: number, x: number, y: number
     }
   }
 
-  const features = [
-    encodeLineFeature(paths.x, 0),
-    encodeLineFeature(paths.y, 1),
-  ].filter((feature) => feature.length > 0);
+  const features = [encodeLineFeature(paths.x, 0), encodeLineFeature(paths.y, 1)].filter(
+    (feature) => feature.length > 0,
+  );
   if (features.length === 0) {
     return new ArrayBuffer(0);
   }
@@ -423,9 +405,7 @@ function projectedTileGenerator(
 }
 
 /** Create a function that generates only the requested geographic grid tile. */
-export function createBBoxGridTileGenerator(
-  options: AddBBoxGridTilesOptions,
-): GridTileGenerator {
+export function createBBoxGridTileGenerator(options: AddBBoxGridTilesOptions): GridTileGenerator {
   const generate = bboxTileGenerator(options);
   return {
     getTile(z, x, y): ArrayBuffer {
@@ -562,7 +542,10 @@ export function addVectorGridTileLayer(
 ): GridTileHandle {
   const layerId = options.id ?? DEFAULT_LAYER_ID;
   const tileUrls = typeof tiles === "string" ? [tiles] : [...tiles];
-  if (tileUrls.length === 0 || tileUrls.some((url) => typeof url !== "string" || url.length === 0)) {
+  if (
+    tileUrls.length === 0 ||
+    tileUrls.some((url) => typeof url !== "string" || url.length === 0)
+  ) {
     throw new GridError("tiles must contain at least one non-empty URL template");
   }
   const style: LayerStyle = {
