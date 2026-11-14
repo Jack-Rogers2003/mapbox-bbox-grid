@@ -50,7 +50,7 @@
     "pnpm": ">=9"
   },
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && tsc -p tsconfig.build.json && node scripts/copy-cjs-types.mjs",
     "typecheck": "tsc -p .",
     "lint": "biome check src tests scripts tsup.config.ts",
     "lint:fix": "biome check --write src tests scripts tsup.config.ts",
