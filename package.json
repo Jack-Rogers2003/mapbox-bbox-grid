@@ -14,13 +14,13 @@
   ],
   "license": "MIT",
   "author": "Jack Rogers",
-  "homepage": "https://github.com/YOUR-USER/mapbox-bbox-grid#readme",
+  "homepage": "https://github.com/Jack-Rogers2003/mapbox-bbox-grid#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/YOUR-USER/mapbox-bbox-grid.git"
+    "url": "git+https://github.com/Jack-Rogers2003/mapbox-bbox-grid.git"
   },
   "bugs": {
-    "url": "https://github.com/YOUR-USER/mapbox-bbox-grid/issues"
+    "url": "https://github.com/Jack-Rogers2003/mapbox-bbox-grid/issues"
   },
   "type": "module",
   "main": "./dist/index.cjs",
