@@ -129,7 +129,8 @@ export function thinGridByPixelSpacing(
     }
     if (feature.geometry.type === "LineString") {
       const index = feature.properties.index;
-      const point = feature.geometry.coordinates[Math.floor(feature.geometry.coordinates.length / 2)];
+      const point =
+        feature.geometry.coordinates[Math.floor(feature.geometry.coordinates.length / 2)];
       if (typeof index === "number" && point) {
         candidates.push({ axis, index, point });
       }
@@ -153,7 +154,9 @@ export function thinGridByPixelSpacing(
     const lines = candidates
       .filter((candidate) => candidate.axis === axis)
       .sort((a, b) => a.index - b.index);
-    const unique = lines.filter((line, index) => index === 0 || line.index !== lines[index - 1].index);
+    const unique = lines.filter(
+      (line, index) => index === 0 || line.index !== lines[index - 1].index,
+    );
     if (unique.length < 2) {
       for (const line of lines) {
         retained.add(`${axis}:${line.index}`);

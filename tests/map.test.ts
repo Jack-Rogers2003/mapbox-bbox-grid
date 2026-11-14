@@ -26,11 +26,9 @@ interface FakeSource {
  * Create a minimal stand-in for `mapboxgl.Map` that records what the plugin does.
  * @param options - Initial style-loaded flag and visible bounds.
  */
-function createFakeMap(options: {
-  styleLoaded?: boolean;
-  bounds?: BBox;
-  pixelsPerDegree?: number;
-} = {}) {
+function createFakeMap(
+  options: { styleLoaded?: boolean; bounds?: BBox; pixelsPerDegree?: number } = {},
+) {
   const sources = new Map<string, FakeSource>();
   const layers = new Map<string, Record<string, unknown>>();
   const moveEndListeners = new Set<() => void>();
@@ -429,11 +427,15 @@ test("worker viewport lines use screen-space thinning and refresh the source", (
   });
   const features = dataOf(fake).features;
   assert.equal(features.length, 2);
-  assert.ok(features.every((feature) => {
-    return feature.geometry.type === "MultiLineString" &&
-      Array.isArray(feature.properties.indices) &&
-      feature.properties.indices.length < 60;
-  }));
+  assert.ok(
+    features.every((feature) => {
+      return (
+        feature.geometry.type === "MultiLineString" &&
+        Array.isArray(feature.properties.indices) &&
+        feature.properties.indices.length < 60
+      );
+    }),
+  );
 
   fake.moveTo([10, 10, 12, 12]);
   assert.equal(fake.log.filter((entry) => entry === "setData").length, 1);
