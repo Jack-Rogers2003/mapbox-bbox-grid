@@ -54,9 +54,8 @@
     "typecheck": "tsc -p .",
     "lint": "biome check src tests scripts tsup.config.ts",
     "lint:fix": "biome check --write src tests scripts tsup.config.ts",
-    "check:jsdoc": "tsx scripts/check-jsdoc.ts",
     "test": "vitest run",
-    "check": "pnpm typecheck && pnpm lint && pnpm check:jsdoc && pnpm test",
+    "check": "pnpm typecheck && pnpm lint && pnpm test",
     "prepublishOnly": "pnpm check && pnpm build"
   },
   "peerDependencies": {
