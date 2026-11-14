@@ -1,4 +1,5 @@
 import { DEFAULT_FIT_PADDING_PX } from "../constants";
+import { GridError } from "../errors";
 import type { BBox, LayerStyle, LineFeatureCollection, MapLike } from "../types";
 
 /** A GeoJSON source whose data can be replaced in place. */
@@ -53,7 +54,16 @@ export function drawGrid(
   }
   map.addSource(id, { type: "geojson", data });
   map.addLayer(
-    { id, type: "line", source: id, layout: style.layout, paint: style.paint },
+    {
+      id,
+      type: "line",
+      source: id,
+      layout: style.layout,
+      paint: style.paint,
+      minzoom: style.minzoom,
+      maxzoom: style.maxzoom,
+      slot: style.slot,
+    },
     style.beforeId,
   );
 }
@@ -64,7 +74,12 @@ export function drawGrid(
  * @param id - Layer id.
  * @param style - Properties to apply.
  */
-export function restyleGrid(map: MapLike, id: string, style: LayerStyle): void {
+export function restyleGrid(
+  map: MapLike,
+  id: string,
+  style: LayerStyle,
+  placement: boolean = false,
+): void {
   if (!map.getLayer(id)) {
     return;
   }
@@ -73,6 +88,36 @@ export function restyleGrid(map: MapLike, id: string, style: LayerStyle): void {
   }
   for (const [name, value] of Object.entries(style.layout)) {
     map.setLayoutProperty(id, name, value);
+  }
+  if (style.minzoom !== undefined || style.maxzoom !== undefined) {
+    if (!map.setLayerZoomRange) {
+      throw new GridError("map does not support updating layer zoom ranges");
+    }
+    map.setLayerZoomRange(id, style.minzoom, style.maxzoom);
+  }
+  if (style.slot !== undefined) {
+    if (!map.setSlot) {
+      throw new GridError("map does not support Mapbox Standard style slots");
+    }
+    map.setSlot(id, style.slot);
+  }
+  if (placement) {
+    if (!map.moveLayer) {
+      throw new GridError("map does not support updating layer order");
+    }
+    map.moveLayer(id, style.beforeId);
+  }
+}
+
+/**
+ * Change layer visibility without rebuilding its source.
+ * @param map - Target map.
+ * @param id - Layer id.
+ * @param visible - Whether the layer should be visible.
+ */
+export function setGridVisibility(map: MapLike, id: string, visible: boolean): void {
+  if (map.getLayer(id)) {
+    map.setLayoutProperty(id, "visibility", visible ? "visible" : "none");
   }
 }
 

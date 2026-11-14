@@ -1,4 +1,5 @@
 import proj4 from "proj4";
+import { DEFAULT_MAX_LINES } from "../constants";
 import { GridError } from "../errors";
 import type {
   BBox,
@@ -6,12 +7,11 @@ import type {
   LineFeatureCollection,
   ProjectedBounds,
   Resolution,
+  ViewportOptions,
 } from "../types";
-import { lineFeature } from "./features";
 import { validateBBox } from "./validate";
 
 const BOUNDARY_STEP_DEGREES = 0.1;
-const DEFAULT_MAX_LINES = 15_000;
 const DEFAULT_MAX_SEGMENT_LENGTH = 10_000;
 const METRES_PER_UNIT: Readonly<Record<string, number>> = {
   m: 1,
@@ -45,7 +45,7 @@ export interface ProjectedGridOptions {
   crs: string;
   /** Grid origin in target CRS coordinates. Defaults to `[0, 0]`. */
   origin?: readonly [x: number, y: number];
-  /** Maximum number of grid lines to emit. Default `15000`. */
+  /** Optional maximum number of grid lines to emit. Unset by default. */
   maxLines?: number;
   /** Maximum projected length between output vertices, in metres. Default `10000`. */
   maxSegmentLength?: number;
@@ -59,10 +59,33 @@ export interface ProjectedBoundsGridOptions {
   crs: string;
   /** Grid origin in target CRS coordinates. Defaults to `[0, 0]`. */
   origin?: readonly [x: number, y: number];
-  /** Maximum number of grid lines to emit. Default `15000`. */
+  /** Optional maximum number of grid lines for full-grid generation. */
   maxLines?: number;
   /** Maximum length between output vertices, in the CRS's native linear units. */
   maxSegmentLength?: number;
+}
+
+/** A GDAL affine transform `[originX, pixelWidth, rowRotation, originY, columnRotation, pixelHeight]`. */
+export type GeoTransform = readonly [
+  originX: number,
+  pixelWidth: number,
+  rowRotation: number,
+  originY: number,
+  columnRotation: number,
+  pixelHeight: number,
+];
+
+/** Raster extent described by a GDAL geotransform and `[rows, columns]` shape. */
+export interface GeoTransformGridSource {
+  affine_transform: GeoTransform;
+  shape: readonly [rows: number, columns: number];
+}
+
+/** Bounds, pixel resolution and grid origin derived from a north-up GDAL transform. */
+export interface GeoTransformGridDefinition {
+  bounds: ProjectedBounds;
+  origin: readonly [x: number, y: number];
+  resolution: readonly [x: number, y: number];
 }
 
 /** A cell's integer grid indices, counted from the configured origin. */
@@ -76,6 +99,57 @@ export interface ProjectedCellIndex {
 type Point = [number, number];
 type Forward = (point: Point) => Point;
 type Inverse = (point: Point) => Point;
+type ProjectedGridFactory = {
+  /** Generate the full chart grid. */
+  full(): LineFeatureCollection;
+  /** Generate only grid lines intersecting a WGS84 view. */
+  viewport(view: BBox, options?: ViewportOptions): LineFeatureCollection;
+};
+
+/**
+ * Convert a north-up GDAL affine transform and raster shape to grid bounds and pixel spacing.
+ * @param affine_transform - GDAL geotransform tuple.
+ * @param shape - Raster dimensions as `[rows, columns]`.
+ * @throws {GridError} If the transform or shape is invalid or rotated.
+ */
+export function fromGeoTransform(
+  affine_transform: GeoTransform,
+  shape: readonly [rows: number, columns: number],
+): GeoTransformGridDefinition {
+  if (
+    !Array.isArray(affine_transform) ||
+    affine_transform.length !== 6 ||
+    !affine_transform.every(Number.isFinite)
+  ) {
+    throw new GridError("affine_transform must contain six finite GDAL transform values");
+  }
+  if (
+    !Array.isArray(shape) ||
+    shape.length !== 2 ||
+    !shape.every((value) => Number.isInteger(value) && value > 0)
+  ) {
+    throw new GridError("shape must contain positive integer [rows, columns]");
+  }
+  const [originX, pixelWidth, rowRotation, originY, columnRotation, pixelHeight] = affine_transform;
+  if (rowRotation !== 0 || columnRotation !== 0) {
+    throw new GridError("rotated GDAL transforms are not supported for axis-aligned grids");
+  }
+  if (pixelWidth === 0 || pixelHeight === 0) {
+    throw new GridError("GDAL pixel dimensions must be non-zero");
+  }
+  const oppositeX = originX + shape[1] * pixelWidth;
+  const oppositeY = originY + shape[0] * pixelHeight;
+  return {
+    bounds: [
+      Math.min(originX, oppositeX),
+      Math.min(originY, oppositeY),
+      Math.max(originX, oppositeX),
+      Math.max(originY, oppositeY),
+    ],
+    origin: [originX, originY],
+    resolution: [Math.abs(pixelWidth), Math.abs(pixelHeight)],
+  };
+}
 
 /** Return the metre conversion factor for a projected CRS's linear units. */
 function linearUnitScale(crs: string): number | undefined {
@@ -119,7 +193,7 @@ function validateProjectedBounds(bounds: ProjectedBounds): ProjectedBounds {
 function createTransforms(
   crs: string,
   requireMetres = true,
-): { forward: Forward; inverse: Inverse } {
+): { forward: Forward; inverse: Inverse; straight: boolean } {
   if (typeof crs !== "string" || crs.length === 0) {
     throw new GridError("crs must be a registered projected CRS or a Proj4 definition");
   }
@@ -154,6 +228,7 @@ function createTransforms(
       forward: (point) => projection.forward(point) as Point,
       /** Convert target CRS coordinates back to longitude/latitude. */
       inverse: (point) => projection.inverse(point) as Point,
+      straight: projectionName === "merc",
     };
   } catch (error) {
     throw new GridError(
@@ -340,16 +415,15 @@ function lineSegments(polygon: readonly Point[], axis: "x" | "y", value: number)
 }
 
 /** Densify one projected segment and convert its vertices back to GeoJSON coordinates. */
-function makeFeature(
+function makeCoordinates(
   segment: [Point, Point],
-  axis: "x" | "y",
-  index: number,
-  maxSegmentLength: number,
+  maxSegmentLength: number | undefined,
   inverse: Inverse,
-): LineFeature {
+): Point[] {
   const [start, end] = segment;
   const length = Math.hypot(end[0] - start[0], end[1] - start[1]);
-  const steps = Math.max(1, Math.ceil(length / maxSegmentLength));
+  const steps =
+    maxSegmentLength === undefined ? 1 : Math.max(1, Math.ceil(length / maxSegmentLength));
   const coordinates: Point[] = [];
   for (let i = 0; i <= steps; i++) {
     const ratio = i / steps;
@@ -362,7 +436,7 @@ function makeFeature(
     }
     coordinates.push(point);
   }
-  return lineFeature(coordinates, { axis, index });
+  return coordinates;
 }
 
 /** Return an integer index for a coordinate, assigning grid-line points to the positive side. */
@@ -384,19 +458,29 @@ function gridFromProjectedPolygon(
   polygon: readonly Point[],
   options: ProjectedBoundsGridOptions,
   inverse: Inverse,
-  defaultSegmentLength: number,
+  defaultSegmentLength: number | undefined,
+  stride: number = 1,
 ): LineFeatureCollection {
   const {
     resolution,
     origin: requestedOrigin,
-    maxLines = DEFAULT_MAX_LINES,
     maxSegmentLength = defaultSegmentLength,
+    maxLines,
   } = options;
-  if (!Number.isFinite(maxLines) || !Number.isInteger(maxLines) || maxLines < 1) {
+  if (
+    maxLines !== undefined &&
+    (!Number.isFinite(maxLines) || !Number.isInteger(maxLines) || maxLines < 1)
+  ) {
     throw new GridError("maxLines must be a positive integer");
   }
-  if (!Number.isFinite(maxSegmentLength) || maxSegmentLength <= 0) {
+  if (
+    maxSegmentLength !== undefined &&
+    (!Number.isFinite(maxSegmentLength) || maxSegmentLength <= 0)
+  ) {
     throw new GridError("maxSegmentLength must be positive and finite");
+  }
+  if (!Number.isSafeInteger(stride) || stride < 1) {
+    throw new GridError("line thinning stride must be a positive integer");
   }
   const [xStep, yStep] = getSteps(resolution);
   const origin = getOrigin(requestedOrigin);
@@ -407,29 +491,208 @@ function gridFromProjectedPolygon(
   const lastX = Math.floor((Math.max(...xs) - origin[0]) / xStep);
   const firstY = Math.ceil((Math.min(...ys) - origin[1]) / yStep);
   const lastY = Math.floor((Math.max(...ys) - origin[1]) / yStep);
-  const lineCount = Math.max(0, lastX - firstX + 1) + Math.max(0, lastY - firstY + 1);
-  if (!Number.isSafeInteger(lineCount) || lineCount > maxLines) {
+  if (![firstX, lastX, firstY, lastY].every(Number.isSafeInteger)) {
+    throw new GridError("grid line indices exceed the safe integer range");
+  }
+  const alignedFirstX = Math.ceil(firstX / stride) * stride;
+  const alignedFirstY = Math.ceil(firstY / stride) * stride;
+  const lineCount =
+    Math.max(0, Math.floor((lastX - alignedFirstX) / stride) + 1) +
+    Math.max(0, Math.floor((lastY - alignedFirstY) / stride) + 1);
+  if (!Number.isSafeInteger(lineCount)) {
+    throw new GridError("grid line count exceeds the safe integer range");
+  }
+  if (maxLines !== undefined && lineCount > maxLines) {
     throw new GridError(`grid would have more than ${maxLines.toLocaleString("en-US")} lines`);
   }
 
-  const features: LineFeature[] = [];
-  for (let index = firstX; index <= lastX; index++) {
-    for (const segment of lineSegments(polygon, "x", origin[0] + index * xStep)) {
-      features.push(makeFeature(segment, "x", index, maxSegmentLength, inverse));
-      if (features.length > maxLines) {
+  const xCoordinates: Point[][] = [];
+  const xIndices: number[] = [];
+  const yCoordinates: Point[][] = [];
+  const yIndices: number[] = [];
+  for (let index = alignedFirstX; index <= lastX; index += stride) {
+    const position = origin[0] + index * xStep;
+    for (const segment of lineSegments(polygon, "x", position)) {
+      xCoordinates.push(makeCoordinates(segment, maxSegmentLength, inverse));
+      xIndices.push(index);
+      if (maxLines !== undefined && xIndices.length + yIndices.length > maxLines) {
         throw new GridError(`grid would have more than ${maxLines.toLocaleString("en-US")} lines`);
       }
     }
   }
-  for (let index = firstY; index <= lastY; index++) {
-    for (const segment of lineSegments(polygon, "y", origin[1] + index * yStep)) {
-      features.push(makeFeature(segment, "y", index, maxSegmentLength, inverse));
-      if (features.length > maxLines) {
+  for (let index = alignedFirstY; index <= lastY; index += stride) {
+    const position = origin[1] + index * yStep;
+    for (const segment of lineSegments(polygon, "y", position)) {
+      yCoordinates.push(makeCoordinates(segment, maxSegmentLength, inverse));
+      yIndices.push(index);
+      if (maxLines !== undefined && xIndices.length + yIndices.length > maxLines) {
         throw new GridError(`grid would have more than ${maxLines.toLocaleString("en-US")} lines`);
       }
     }
+  }
+  const features: LineFeature[] = [];
+  if (xCoordinates.length > 0) {
+    features.push({
+      type: "Feature",
+      properties: { axis: "x", indices: xIndices },
+      geometry: { type: "MultiLineString", coordinates: xCoordinates },
+    });
+  }
+  if (yCoordinates.length > 0) {
+    features.push({
+      type: "Feature",
+      properties: { axis: "y", indices: yIndices },
+      geometry: { type: "MultiLineString", coordinates: yCoordinates },
+    });
   }
   return { type: "FeatureCollection", features };
+}
+
+/**
+ * Clip a polygon to a rectangle with the Sutherland-Hodgman algorithm.
+ * @param polygon - Polygon in projected coordinates.
+ * @param bounds - Rectangle in projected coordinates.
+ */
+function clipToBounds(polygon: readonly Point[], bounds: ProjectedBounds): Point[] {
+  let output = [...polygon];
+  const edges: {
+    inside(point: Point): boolean;
+    intersect(start: Point, end: Point): Point;
+  }[] = [
+    {
+      inside: (point) => point[0] >= bounds[0],
+      intersect: (a, b) => [bounds[0], a[1] + ((bounds[0] - a[0]) / (b[0] - a[0])) * (b[1] - a[1])],
+    },
+    {
+      inside: (point) => point[0] <= bounds[2],
+      intersect: (a, b) => [bounds[2], a[1] + ((bounds[2] - a[0]) / (b[0] - a[0])) * (b[1] - a[1])],
+    },
+    {
+      inside: (point) => point[1] >= bounds[1],
+      intersect: (a, b) => [a[0] + ((bounds[1] - a[1]) / (b[1] - a[1])) * (b[0] - a[0]), bounds[1]],
+    },
+    {
+      inside: (point) => point[1] <= bounds[3],
+      intersect: (a, b) => [a[0] + ((bounds[3] - a[1]) / (b[1] - a[1])) * (b[0] - a[0]), bounds[3]],
+    },
+  ];
+  for (const edge of edges) {
+    const input = output;
+    output = [];
+    if (input.length === 0) {
+      break;
+    }
+    let start = input[input.length - 1];
+    for (const end of input) {
+      const startInside = edge.inside(start);
+      const endInside = edge.inside(end);
+      if (endInside) {
+        if (!startInside) {
+          output.push(edge.intersect(start, end));
+        }
+        output.push(end);
+      } else if (startInside) {
+        output.push(edge.intersect(start, end));
+      }
+      start = end;
+    }
+  }
+  return output;
+}
+
+/**
+ * Prepare a projected grid generator, retaining its transforms for viewport refreshes.
+ * @param bounds - `[minX, minY, maxX, maxY]` in the projected CRS.
+ * @param options - CRS, resolution, origin and generation limits.
+ * @returns Cached full-grid and viewport generation functions.
+ */
+export function createProjectedGridFromBoundsFactory(
+  bounds: ProjectedBounds,
+  options: ProjectedBoundsGridOptions,
+): ProjectedGridFactory {
+  const [minX, minY, maxX, maxY] = validateProjectedBounds(bounds);
+  const unitScale = linearUnitScale(options.crs);
+  if (unitScale === undefined) {
+    throw new GridError("crs must be a supported projected CRS with linear units");
+  }
+  const transforms = createTransforms(options.crs, false);
+  const defaultSegmentLength = transforms.straight
+    ? undefined
+    : DEFAULT_MAX_SEGMENT_LENGTH / unitScale;
+  const polygon: Point[] = [
+    [minX, minY],
+    [maxX, minY],
+    [maxX, maxY],
+    [minX, maxY],
+  ];
+  const generate = (
+    area: readonly Point[],
+    stride = 1,
+    viewportMode: boolean = false,
+  ): LineFeatureCollection =>
+    gridFromProjectedPolygon(
+      area,
+      viewportMode ? { ...options, maxLines: undefined } : options,
+      transforms.inverse,
+      defaultSegmentLength,
+      stride,
+    );
+  return {
+    full: () => generate(polygon),
+    viewport: (view, viewportOptions = {}) => {
+      const { padding = 0.25, maxLines = DEFAULT_MAX_LINES } = viewportOptions;
+      if (!Number.isFinite(padding) || padding < 0) {
+        throw new GridError("viewport padding must be >= 0");
+      }
+      if (!Number.isInteger(maxLines) || maxLines < 1) {
+        throw new GridError("viewport maxLines must be a positive integer");
+      }
+      if (
+        !Array.isArray(view) ||
+        view.length !== 4 ||
+        !view.every(Number.isFinite) ||
+        view[0] >= view[2] ||
+        view[1] >= view[3]
+      ) {
+        throw new GridError("view must be a finite [west, south, east, north] bbox");
+      }
+      const padX = (view[2] - view[0]) * padding;
+      const padY = (view[3] - view[1]) * padding;
+      const geographicView: BBox = [
+        Math.max(-180, view[0] - padX),
+        Math.max(-90, view[1] - padY),
+        Math.min(180, view[2] + padX),
+        Math.min(90, view[3] + padY),
+      ];
+      if (geographicView[0] >= geographicView[2] || geographicView[1] >= geographicView[3]) {
+        return { type: "FeatureCollection", features: [] };
+      }
+      const projectedView = clipToBounds(
+        projectBoundary(geographicView, transforms.forward),
+        bounds,
+      );
+      if (projectedView.length < 3) {
+        return { type: "FeatureCollection", features: [] };
+      }
+      const [xStep, yStep] = getSteps(options.resolution);
+      const origin = getOrigin(options.origin);
+      const xs = projectedView.map((point) => point[0]);
+      const ys = projectedView.map((point) => point[1]);
+      const firstX = Math.ceil((Math.min(...xs) - origin[0]) / xStep);
+      const lastX = Math.floor((Math.max(...xs) - origin[0]) / xStep);
+      const firstY = Math.ceil((Math.min(...ys) - origin[1]) / yStep);
+      const lastY = Math.floor((Math.max(...ys) - origin[1]) / yStep);
+      if (![firstX, lastX, firstY, lastY].every(Number.isSafeInteger)) {
+        throw new GridError("viewport line indices exceed the safe integer range");
+      }
+      const candidateCount = Math.max(0, lastX - firstX + 1) + Math.max(0, lastY - firstY + 1);
+      if (!Number.isSafeInteger(candidateCount)) {
+        throw new GridError("viewport line count exceeds the safe integer range");
+      }
+      const stride = Math.max(1, Math.ceil(candidateCount / maxLines));
+      return generate(projectedView, stride, true);
+    },
+  };
 }
 
 /**
@@ -444,24 +707,7 @@ export function createProjectedGridFromBounds(
   bounds: ProjectedBounds,
   options: ProjectedBoundsGridOptions,
 ): LineFeatureCollection {
-  const [minX, minY, maxX, maxY] = validateProjectedBounds(bounds);
-  const unitScale = linearUnitScale(options.crs);
-  if (unitScale === undefined) {
-    throw new GridError("crs must be a supported projected CRS with linear units");
-  }
-  const { inverse } = createTransforms(options.crs, false);
-  const defaultSegmentLength = DEFAULT_MAX_SEGMENT_LENGTH / unitScale;
-  return gridFromProjectedPolygon(
-    [
-      [minX, minY],
-      [maxX, minY],
-      [maxX, maxY],
-      [minX, maxY],
-    ],
-    options,
-    inverse,
-    defaultSegmentLength,
-  );
+  return createProjectedGridFromBoundsFactory(bounds, options).full();
 }
 
 /**
@@ -512,13 +758,15 @@ export function createProjectedGrid(
   options: ProjectedGridOptions,
 ): LineFeatureCollection {
   const validatedBBox = validateBBox(bbox);
-  const { crs, maxSegmentLength = DEFAULT_MAX_SEGMENT_LENGTH } = options;
-  const { forward, inverse } = createTransforms(crs);
-  const polygon = projectBoundary(validatedBBox, forward);
+  const { crs } = options;
+  const transforms = createTransforms(crs);
+  const polygon = projectBoundary(validatedBBox, transforms.forward);
+  const maxSegmentLength =
+    options.maxSegmentLength ?? (transforms.straight ? undefined : DEFAULT_MAX_SEGMENT_LENGTH);
   return gridFromProjectedPolygon(
     polygon,
     { ...options, maxSegmentLength },
-    inverse,
-    DEFAULT_MAX_SEGMENT_LENGTH,
+    transforms.inverse,
+    transforms.straight ? undefined : DEFAULT_MAX_SEGMENT_LENGTH,
   );
 }

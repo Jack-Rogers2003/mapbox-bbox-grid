@@ -18,11 +18,13 @@ export type Resolution = number | readonly [x: number, y: number];
 /** Cell counts: one number (same count on both axes) or `[columns, rows]`. */
 export type CellCounts = number | readonly [columns: number, rows: number];
 
-/** A GeoJSON Feature holding a single LineString. */
+/** A GeoJSON Feature holding one or more line segments. */
 export interface LineFeature {
   type: "Feature";
-  properties: Record<string, number | string>;
-  geometry: { type: "LineString"; coordinates: [number, number][] };
+  properties: Record<string, unknown>;
+  geometry:
+    | { type: "LineString"; coordinates: [number, number][] }
+    | { type: "MultiLineString"; coordinates: [number, number][][] };
 }
 
 /** A GeoJSON FeatureCollection of LineString features. */
@@ -71,6 +73,12 @@ export interface AddGridSettings extends GridSettings {
   layout?: Record<string, unknown>;
   /** Insert the layer below this layer id. Only applied when the layer is first created. */
   beforeId?: string;
+  /** Minimum zoom at which the layer is visible. */
+  minzoom?: number;
+  /** Maximum zoom at which the layer is visible. */
+  maxzoom?: number;
+  /** Mapbox Standard style slot. */
+  slot?: string;
   /** Fit the map to the bbox. `true` uses 40px padding; pass an object for custom `fitBounds` options. */
   fit?: boolean | Record<string, unknown>;
 }
@@ -139,6 +147,10 @@ export interface GridHandle {
    * merged options are invalid.
    */
   update(options: GridUpdateOptions): void;
+  /** Show the layer. */
+  show(): void;
+  /** Hide the layer without removing its source. */
+  hide(): void;
   /** Remove the layer and source from the map and stop listening to map events. */
   remove(): void;
 }
@@ -176,6 +188,12 @@ export interface MapLike {
   setPaintProperty(layerId: string, name: string, value: unknown): unknown;
   /** Update one layout property of a layer. */
   setLayoutProperty(layerId: string, name: string, value: unknown): unknown;
+  /** Update the zoom range for a layer. */
+  setLayerZoomRange?(layerId: string, minzoom?: number | null, maxzoom?: number | null): unknown;
+  /** Assign a Mapbox Standard style slot. */
+  setSlot?(layerId: string, slot?: string | null): unknown;
+  /** Move a layer, optionally below another layer. */
+  moveLayer?(id: string, beforeId?: string): unknown;
   /** Whether the current style has finished loading. */
   isStyleLoaded(): boolean;
   /** Run a listener once, when the map first loads. */
@@ -201,4 +219,7 @@ export interface LayerStyle {
   layout: Record<string, unknown>;
   /** Layer to insert below, when creating the layer. */
   beforeId?: string;
+  minzoom?: number;
+  maxzoom?: number;
+  slot?: string;
 }
