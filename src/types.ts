@@ -172,8 +172,13 @@ export interface MapBoundsLike {
  * never has to be a hard dependency.
  */
 export interface MapLike {
-  /** Add a GeoJSON source. */
-  addSource(id: string, source: { type: "geojson"; data: LineFeatureCollection }): unknown;
+  /** Add a GeoJSON or vector-tile source. */
+  addSource(
+    id: string,
+    source:
+      | { type: "geojson"; data: LineFeatureCollection }
+      | { type: "vector"; tiles: string[]; minzoom?: number; maxzoom?: number },
+  ): unknown;
   /** Look up a source by id. */
   getSource(id: string): unknown;
   /** Remove a source by id. */
