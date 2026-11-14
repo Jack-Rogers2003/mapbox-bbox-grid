@@ -30,10 +30,10 @@
 ## D. Later releases (automated)
 15. One-time: on npmjs.com create a **granular access token** with read+write on this package. In the GitHub repo
     go to Settings > Secrets and variables > Actions and add it as `NPM_TOKEN`.
-16. To release: bump the version (edit package.json, or `npm version patch`, which works fine in a pnpm project),
-    then `git push && git push --tags`.
-17. On GitHub: Releases > Draft a new release > choose the tag > Publish.
-    `.github/workflows/publish.yml` runs check + build and `pnpm publish --provenance`.
+16. To release: create and push a `vX.Y.Z` tag for the commit you want to release.
+17. On GitHub: Releases > Draft a new release > choose that tag > Publish.
+    `.github/workflows/publish.yml` derives the package version from the tag, then runs check + build and
+    `pnpm publish --provenance`. No version bump in `package.json` is needed.
     `.github/workflows/ci.yml` also runs the checks on every push and pull request.
 
 ## Rules to remember
