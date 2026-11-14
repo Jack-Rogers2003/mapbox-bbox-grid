@@ -1,6 +1,14 @@
-import { DEFAULT_FIT_PADDING_PX } from "../constants";
+import { DEFAULT_FIT_PADDING_PX, DEFAULT_MAX_LINES } from "../constants";
 import { GridError } from "../errors";
-import type { BBox, LayerStyle, LineFeatureCollection, MapLike } from "../types";
+import type {
+  BBox,
+  LayerStyle,
+  LineFeature,
+  LineFeatureCollection,
+  MapLike,
+  MapViewportOptions,
+  ViewportOptions,
+} from "../types";
 
 /** A GeoJSON source whose data can be replaced in place. */
 interface UpdatableSource {
@@ -32,6 +40,194 @@ export function whenStyleReady(map: MapLike, callback: () => void): void {
   } else {
     map.once("load", callback);
   }
+}
+
+/**
+ * Resolve map-specific viewport options into a bounded geometry-generation budget.
+ * @param map - Target map.
+ * @param view - Visible bounds.
+ * @param options - Map viewport options.
+ */
+export function viewportGenerationOptions(
+  map: MapLike,
+  view: BBox,
+  options: MapViewportOptions,
+): ViewportOptions {
+  const { minSpacingPx, ...generationOptions } = options;
+  if (minSpacingPx === undefined) {
+    return generationOptions;
+  }
+  if (!Number.isFinite(minSpacingPx) || minSpacingPx <= 0) {
+    throw new GridError("viewport minSpacingPx must be positive and finite");
+  }
+  if (!map.project) {
+    throw new GridError("viewport minSpacingPx requires map.project()");
+  }
+
+  const padding = options.padding ?? 0.25;
+  if (!Number.isFinite(padding) || padding < 0) {
+    throw new GridError("viewport padding must be >= 0");
+  }
+  const padX = (view[2] - view[0]) * padding;
+  const padY = (view[3] - view[1]) * padding;
+  const west = view[0] - padX;
+  const east = view[2] + padX;
+  const south = view[1] - padY;
+  const north = view[3] + padY;
+  const centerX = (west + east) / 2;
+  const centerY = (south + north) / 2;
+  const left = map.project([west, centerY]);
+  const right = map.project([east, centerY]);
+  const bottom = map.project([centerX, south]);
+  const top = map.project([centerX, north]);
+  const width = Math.hypot(right.x - left.x, right.y - left.y);
+  const height = Math.hypot(top.x - bottom.x, top.y - bottom.y);
+  if (![width, height].every(Number.isFinite)) {
+    throw new GridError("map.project() returned invalid viewport coordinates");
+  }
+
+  const pixelBudget = Math.max(
+    1,
+    Math.ceil(width / minSpacingPx) + Math.ceil(height / minSpacingPx) + 2,
+  );
+  return {
+    ...generationOptions,
+    maxLines:
+      generationOptions.maxLines === undefined
+        ? Math.max(DEFAULT_MAX_LINES, pixelBudget)
+        : Math.min(generationOptions.maxLines, pixelBudget),
+  };
+}
+
+/**
+ * Thin viewport lines by measured screen-space spacing, preserving grid-index multiples.
+ * @param map - Target map.
+ * @param data - Generated viewport lines.
+ * @param minSpacingPx - Minimum target spacing.
+ */
+export function thinGridByPixelSpacing(
+  map: MapLike,
+  data: LineFeatureCollection,
+  minSpacingPx: number | undefined,
+): LineFeatureCollection {
+  if (minSpacingPx === undefined) {
+    return data;
+  }
+  if (!Number.isFinite(minSpacingPx) || minSpacingPx <= 0) {
+    throw new GridError("viewport minSpacingPx must be positive and finite");
+  }
+  if (!map.project) {
+    throw new GridError("viewport minSpacingPx requires map.project()");
+  }
+
+  type Candidate = { axis: string; index: number; point: [number, number] };
+  const candidates: Candidate[] = [];
+  for (const feature of data.features) {
+    const axis = feature.properties.axis;
+    if (axis !== "x" && axis !== "y") {
+      continue;
+    }
+    if (feature.geometry.type === "LineString") {
+      const index = feature.properties.index;
+      const point = feature.geometry.coordinates[Math.floor(feature.geometry.coordinates.length / 2)];
+      if (typeof index === "number" && point) {
+        candidates.push({ axis, index, point });
+      }
+    } else {
+      const indices = feature.properties.indices;
+      if (!Array.isArray(indices)) {
+        continue;
+      }
+      feature.geometry.coordinates.forEach((line, component) => {
+        const index = indices[component];
+        const point = line[Math.floor(line.length / 2)];
+        if (typeof index === "number" && point) {
+          candidates.push({ axis, index, point });
+        }
+      });
+    }
+  }
+
+  const retained = new Set<string>();
+  for (const axis of ["x", "y"] as const) {
+    const lines = candidates
+      .filter((candidate) => candidate.axis === axis)
+      .sort((a, b) => a.index - b.index);
+    const unique = lines.filter((line, index) => index === 0 || line.index !== lines[index - 1].index);
+    if (unique.length < 2) {
+      for (const line of lines) {
+        retained.add(`${axis}:${line.index}`);
+      }
+      continue;
+    }
+
+    const projected = unique.map((line) => {
+      const point = map.project?.(line.point);
+      if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+        throw new GridError("map.project() returned invalid grid-line coordinates");
+      }
+      return { index: line.index, x: point.x, y: point.y };
+    });
+    let minDistance = Number.POSITIVE_INFINITY;
+    let baseStride = Number.POSITIVE_INFINITY;
+    for (let index = 1; index < projected.length; index += 1) {
+      const previous = projected[index - 1];
+      const current = projected[index];
+      minDistance = Math.min(
+        minDistance,
+        Math.hypot(current.x - previous.x, current.y - previous.y),
+      );
+      baseStride = Math.min(baseStride, current.index - previous.index);
+    }
+    const multiplier =
+      minDistance <= 0 ? lines.length : Math.max(1, Math.ceil(minSpacingPx / minDistance));
+    const stride = baseStride * multiplier;
+    const first = unique[0].index;
+    const last = unique[unique.length - 1].index;
+    for (const line of lines) {
+      if (line.index === first || line.index === last || Math.abs(line.index % stride) === 0) {
+        retained.add(`${axis}:${line.index}`);
+      }
+    }
+  }
+
+  const features: LineFeature[] = [];
+  for (const feature of data.features) {
+    const axis = feature.properties.axis;
+    if (axis !== "x" && axis !== "y") {
+      features.push(feature);
+    } else if (feature.geometry.type === "LineString") {
+      const index = feature.properties.index;
+      if (typeof index !== "number" || retained.has(`${axis}:${index}`)) {
+        features.push(feature);
+      }
+    } else {
+      const indices = feature.properties.indices;
+      if (!Array.isArray(indices)) {
+        features.push(feature);
+        continue;
+      }
+      const coordinates: [number, number][][] = [];
+      const keptIndices: number[] = [];
+      feature.geometry.coordinates.forEach((line, component) => {
+        const index = indices[component];
+        if (typeof index !== "number" || retained.has(`${axis}:${index}`)) {
+          coordinates.push(line);
+          if (typeof index === "number") {
+            keptIndices.push(index);
+          }
+        }
+      });
+      if (coordinates.length > 0) {
+        features.push({
+          ...feature,
+          properties: { ...feature.properties, indices: keptIndices },
+          geometry: { type: "MultiLineString", coordinates },
+        });
+      }
+    }
+  }
+  return { type: "FeatureCollection", features };
 }
 
 /**

@@ -8,9 +8,10 @@ import type {
   GridOptions,
   GridUpdateOptions,
   LayerStyle,
+  LineFeatureCollection,
   MapBoundsLike,
   MapLike,
-  ViewportOptions,
+  MapViewportOptions,
 } from "../types";
 import {
   drawGrid,
@@ -18,6 +19,8 @@ import {
   removeGrid,
   restyleGrid,
   setGridVisibility,
+  thinGridByPixelSpacing,
+  viewportGenerationOptions,
   whenStyleReady,
 } from "./layer";
 
@@ -26,7 +29,7 @@ import {
  * @param viewport - The raw option value.
  * @returns Viewport options, or `undefined` when viewport mode is off.
  */
-function resolveViewport(viewport: AddGridOptions["viewport"]): ViewportOptions | undefined {
+function resolveViewport(viewport: AddGridOptions["viewport"]): MapViewportOptions | undefined {
   if (!viewport) {
     return undefined;
   }
@@ -221,9 +224,15 @@ class BBoxGridLayer implements GridHandle {
       return;
     }
     const viewport = resolveViewport(this.options.viewport);
-    const data = viewport
-      ? this.current.linesInView(boundsToBBox(this.map.getBounds()), viewport)
-      : this.current.toGeoJSON(this.options.mode ?? "lines");
+    let data: LineFeatureCollection;
+    if (viewport) {
+      const view = boundsToBBox(this.map.getBounds());
+      const generationOptions = viewportGenerationOptions(this.map, view, viewport);
+      data = this.current.linesInView(view, generationOptions);
+      data = thinGridByPixelSpacing(this.map, data, viewport.minSpacingPx);
+    } else {
+      data = this.current.toGeoJSON(this.options.mode ?? "lines");
+    }
     drawGrid(this.map, this.options.id ?? DEFAULT_LAYER_ID, data, styleOf(this.options));
     if (!this.visible) {
       setGridVisibility(this.map, this.options.id ?? DEFAULT_LAYER_ID, false);
