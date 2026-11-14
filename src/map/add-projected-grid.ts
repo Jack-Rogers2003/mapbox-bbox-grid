@@ -16,17 +16,25 @@ import type {
   LayerStyle,
   LineFeatureCollection,
   MapLike,
+  MapViewportOptions,
   ProjectedBounds,
-  ViewportOptions,
 } from "../types";
-import { drawGrid, removeGrid, restyleGrid, setGridVisibility, whenStyleReady } from "./layer";
+import {
+  drawGrid,
+  removeGrid,
+  restyleGrid,
+  setGridVisibility,
+  thinGridByPixelSpacing,
+  viewportGenerationOptions,
+  whenStyleReady,
+} from "./layer";
 
 /** Options for drawing a chart-CRS grid directly on a map. */
 export type AddProjectedGridOptions = Omit<ProjectedBoundsGridOptions, "resolution"> & {
   /** Cell size in the CRS's native linear units. Defaults to the GDAL pixel size for affine input. */
   resolution?: ProjectedBoundsGridOptions["resolution"];
   /** Draw only the visible area and refresh when map movement ends. */
-  viewport?: boolean | ViewportOptions;
+  viewport?: boolean | MapViewportOptions;
   /** Id used by the map source and layer. Default `"bboxgrid"`. */
   id?: string;
   /** Mapbox `line` paint properties, merged over the defaults. */
@@ -141,7 +149,7 @@ export function addProjectedGrid(
   let lastViewKey: string | undefined;
   let latestWorkerRequest = 0;
 
-  const viewportOptions = (): ViewportOptions | undefined => {
+  const viewportOptions = (): MapViewportOptions | undefined => {
     if (!optionsState.viewport) {
       return undefined;
     }
@@ -160,6 +168,7 @@ export function addProjectedGrid(
       if (!force && key === lastViewKey) {
         return;
       }
+      const generationOptions = viewportGenerationOptions(map, view, viewport);
       if (optionsState.worker) {
         const requestId = ++latestWorkerRequest;
         optionsState.worker.postMessage({
@@ -168,12 +177,12 @@ export function addProjectedGrid(
           bounds: gridBounds,
           options: workerGridOptions(),
           view,
-          viewportOptions: viewport,
+          viewportOptions: generationOptions,
         });
         lastViewKey = key;
         return;
       }
-      data = generator.viewport(view, viewport);
+      data = generator.viewport(view, generationOptions);
       lastViewKey = key;
     } else {
       if (optionsState.worker) {
@@ -188,6 +197,9 @@ export function addProjectedGrid(
       }
       data = generator.full();
       lastViewKey = undefined;
+    }
+    if (viewport) {
+      data = thinGridByPixelSpacing(map, data, viewport.minSpacingPx);
     }
     drawGrid(map, id, data, styleOf(optionsState));
     if (!visible) {
@@ -219,7 +231,11 @@ export function addProjectedGrid(
       if (removed || !response.data) {
         return;
       }
-      drawGrid(map, id, response.data, styleOf(optionsState));
+      const viewport = viewportOptions();
+      const data = viewport
+        ? thinGridByPixelSpacing(map, response.data, viewport.minSpacingPx)
+        : response.data;
+      drawGrid(map, id, data, styleOf(optionsState));
       if (!visible) {
         setGridVisibility(map, id, false);
       }

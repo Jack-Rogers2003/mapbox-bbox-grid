@@ -33,7 +33,9 @@ interface FakeSource {
  * Create a minimal stand-in for `mapboxgl.Map` that records what the plugin does.
  * @param options - Initial style-loaded flag and visible bounds.
  */
-function createFakeMap(options: { styleLoaded?: boolean; bounds?: BBox } = {}) {
+function createFakeMap(
+  options: { styleLoaded?: boolean; bounds?: BBox; pixelsPerDegree?: number } = {},
+) {
   const sources = new Map<string, FakeSource>();
   const layers = new Map<string, Record<string, unknown>>();
   const moveEndListeners = new Set<() => void>();
@@ -98,6 +100,10 @@ function createFakeMap(options: { styleLoaded?: boolean; bounds?: BBox } = {}) {
       getEast: () => bounds[2],
       getNorth: () => bounds[3],
     }),
+    project: (coordinate) => {
+      const scale = options.pixelsPerDegree ?? 1;
+      return { x: coordinate[0] * scale, y: coordinate[1] * scale };
+    },
     fitBounds(b, o) {
       log.push(`fitBounds ${JSON.stringify(b)} ${JSON.stringify(o)}`);
     },
@@ -270,6 +276,52 @@ test("viewport mode draws only the visible lines and follows the camera", () => 
 
   handle.remove();
   assert.equal(fake.moveEndListeners.size, 0, "moveend listener removed");
+});
+
+test("viewport minSpacingPx thins geographic lines by grid-index multiples", () => {
+  const fake = createFakeMap({ bounds: [0, 0, 1, 1], pixelsPerDegree: 100 });
+  addBBoxGrid(fake.map, {
+    bbox: [0, 0, 1, 1],
+    resolution: 0.01,
+    viewport: { padding: 0, minSpacingPx: 4 },
+  });
+
+  const data = dataOf(fake);
+  for (const axis of ["x", "y"]) {
+    const indices = data.features
+      .filter((feature) => feature.properties.axis === axis)
+      .map((feature) => Number(feature.properties.index));
+    assert.ok(indices.length < 30, `expected pixel thinning on ${axis}`);
+    assert.ok(
+      indices.slice(1, -1).every((index, position) => {
+        return index - indices[position] >= 4;
+      }),
+    );
+    assert.ok(indices.includes(0));
+    assert.ok(indices.includes(100));
+  }
+});
+
+test("projected viewport minSpacingPx thins MultiLineString components", () => {
+  const fake = createFakeMap({ bounds: [-1, -1, 1, 1], pixelsPerDegree: 100 });
+  addProjectedGrid(fake.map, [-100_000, -100_000, 100_000, 100_000], {
+    crs: "EPSG:3857",
+    resolution: 1000,
+    viewport: { padding: 0, minSpacingPx: 4 },
+  });
+
+  const data = dataOf(fake);
+  assert.ok(data.features.length > 0);
+  for (const feature of data.features) {
+    assert.equal(feature.geometry.type, "MultiLineString");
+    const indices = feature.properties.indices as number[];
+    assert.ok(indices.length < 100);
+    assert.ok(
+      indices.slice(1, -1).every((index, position) => {
+        return index - indices[position] >= 4;
+      }),
+    );
+  }
 });
 
 test("viewport mode lifts the cell cap for lines", () => {
@@ -480,16 +532,26 @@ test("on-demand projected vector tiles generate CRS-aligned lines", async () => 
   tileProtocol.remove();
 });
 
-test("optional worker generates projected viewport lines and refreshes the map source", () => {
-  const fake = createFakeMap({ bounds: [-1, -1, 1, 1] });
+test("worker viewport lines use screen-space thinning and refresh the source", () => {
+  const fake = createFakeMap({ bounds: [-1, -1, 1, 1], pixelsPerDegree: 100 });
   const worker = createGridWorker();
   const handle = addProjectedGrid(fake.map, [-1_000_000, -1_000_000, 1_000_000, 1_000_000], {
     crs: "EPSG:3857",
     resolution: 1000,
-    viewport: { padding: 0, maxLines: 10 },
+    viewport: { padding: 0, minSpacingPx: 4 },
     worker,
   });
-  assert.equal(dataOf(fake).features.length, 2);
+  const features = dataOf(fake).features;
+  assert.equal(features.length, 2);
+  assert.ok(
+    features.every((feature) => {
+      return (
+        feature.geometry.type === "MultiLineString" &&
+        Array.isArray(feature.properties.indices) &&
+        feature.properties.indices.length < 60
+      );
+    }),
+  );
 
   fake.moveTo([10, 10, 12, 12]);
   assert.equal(fake.log.filter((entry) => entry === "setData").length, 1);

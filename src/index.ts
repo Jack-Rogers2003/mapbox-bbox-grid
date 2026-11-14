@@ -61,6 +61,7 @@ export type {
   LineFeatureCollection,
   MapBoundsLike,
   MapLike,
+  MapViewportOptions,
   ProjectedBounds,
   Resolution,
   Units,

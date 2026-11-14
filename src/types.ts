@@ -61,6 +61,15 @@ export interface ViewportOptions {
   maxLines?: number;
 }
 
+/** Viewport options for map overlays, including screen-space thinning. */
+export interface MapViewportOptions extends ViewportOptions {
+  /**
+   * Target minimum spacing between visible lines in screen pixels. Requires a map with `project()`.
+   * When set, line thinning is based on the projected viewport size and measured line spacing.
+   */
+  minSpacingPx?: number;
+}
+
 /** Shared options for drawing a grid on a map. */
 export interface AddGridSettings extends GridSettings {
   /** Extent of the grid as `[west, south, east, north]`. */
@@ -93,7 +102,7 @@ export type AddGridOptions = AddGridSettings &
         resolution: Resolution;
         cells?: undefined;
         mode?: "lines";
-        viewport?: boolean | ViewportOptions;
+        viewport?: boolean | MapViewportOptions;
       }
     | {
         resolution: Resolution;
@@ -116,7 +125,7 @@ export type GridUpdateOptions = Partial<AddGridSettings> &
         resolution: Resolution;
         cells?: undefined;
         mode?: "lines";
-        viewport?: boolean | ViewportOptions;
+        viewport?: boolean | MapViewportOptions;
       }
     | {
         resolution: Resolution;
@@ -134,7 +143,7 @@ export type GridUpdateOptions = Partial<AddGridSettings> &
         resolution?: undefined;
         cells?: undefined;
         mode?: GridMode;
-        viewport?: boolean | ViewportOptions;
+        viewport?: boolean | MapViewportOptions;
       }
   );
 
@@ -209,6 +218,8 @@ export interface MapLike {
   off(type: "moveend", listener: () => void): unknown;
   /** Current visible bounds. */
   getBounds(): MapBoundsLike;
+  /** Project a geographic coordinate to screen pixels. */
+  project?(coordinate: [number, number]): { x: number; y: number };
   /** Move the camera to show the given bounds. */
   fitBounds(
     bounds: [[number, number], [number, number]],
