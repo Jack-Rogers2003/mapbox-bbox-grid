@@ -1,6 +1,5 @@
 {
   "name": "@jack_rogers/mapbox-bbox-grid",
-  "version": "0.1.0",
   "description": "Turn a bounding box and a resolution into GeoJSON grid LineStrings and draw them on a Mapbox GL JS map.",
   "keywords": [
     "mapbox",

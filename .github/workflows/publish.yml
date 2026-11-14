@@ -18,6 +18,8 @@ jobs:
           node-version: 22
           cache: pnpm
           registry-url: "https://registry.npmjs.org"
+      - name: Set package version from release tag
+        run: npm pkg set "version=${GITHUB_REF_NAME#v}"
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - run: pnpm build
