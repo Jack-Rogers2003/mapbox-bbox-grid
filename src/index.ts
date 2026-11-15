@@ -48,6 +48,13 @@ export {
   installGridTileProtocol,
 } from "./map/grid-tile-protocol";
 export type {
+  ShaderGridHandle,
+  ShaderGridOptions,
+  ShaderGridStyleUpdate,
+  ShaderProjectedGridOptions,
+} from "./map/shader-grid";
+export { addShaderBBoxGrid, addShaderProjectedGrid } from "./map/shader-grid";
+export type {
   AddGridOptions,
   AddGridSettings,
   BBox,

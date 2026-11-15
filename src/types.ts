@@ -212,14 +212,20 @@ export interface MapLike {
   isStyleLoaded(): boolean;
   /** Run a listener once, when the map first loads. */
   once(type: "load", listener: () => void): unknown;
-  /** Listen for the end of a pan, zoom or other camera movement. */
-  on(type: "moveend", listener: () => void): unknown;
-  /** Stop listening for the end of camera movements. */
-  off(type: "moveend", listener: () => void): unknown;
+  /** Listen for map movement or WebGL context lifecycle events. */
+  on(type: "moveend" | "webglcontextlost" | "webglcontextrestored", listener: () => void): unknown;
+  /** Stop listening for map movement or WebGL context lifecycle events. */
+  off(type: "moveend" | "webglcontextlost" | "webglcontextrestored", listener: () => void): unknown;
   /** Current visible bounds. */
   getBounds(): MapBoundsLike;
   /** Project a geographic coordinate to screen pixels. */
   project?(coordinate: [number, number]): { x: number; y: number };
+  /** Current map projection, when exposed by the map implementation. */
+  getProjection?(): { name?: string };
+  /** Request another render frame for a custom WebGL layer. */
+  triggerRepaint?(): void;
+  /** Device-pixel ratio used by the map renderer. */
+  getPixelRatio?(): number;
   /** Move the camera to show the given bounds. */
   fitBounds(
     bounds: [[number, number], [number, number]],
