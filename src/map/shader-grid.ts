@@ -1564,7 +1564,7 @@ function createProjectedGeometryGrid(
           context.ONE,
           context.ONE_MINUS_SRC_ALPHA,
         );
-        context.drawArrays(context.TRIANGLES, 0, vertices.length / 5);
+        context.drawArrays(context.TRIANGLES, 0, vertices.length / 11);
       } finally {
         restoreGlState(context, state);
       }

@@ -158,6 +158,7 @@ function createFakeMap(
 /** Create a WebGL context double sufficient to exercise custom-layer lifecycle. */
 function createFakeWebGLContext() {
   let drawCalls = 0;
+  const drawVertexCounts: number[] = [];
   const shaderSources: string[] = [];
   const bufferUploads: number[][] = [];
   const uniform2Values = new Map<string, [number, number]>();
@@ -266,13 +267,15 @@ function createFakeWebGLContext() {
     uniform1f(location: { name: string }, value: number) {
       uniform1Values.set(location.name, value);
     },
-    drawArrays() {
+    drawArrays(_mode: number, _first: number, count: number) {
       drawCalls += 1;
+      drawVertexCounts.push(count);
     },
   };
   return {
     context,
     drawCalls: () => drawCalls,
+    drawVertexCounts: () => drawVertexCounts,
     shaderSources,
     bufferUploads,
     uniform2Values,
@@ -828,6 +831,7 @@ test("shader projected grids support EPSG:3857 and arbitrary projected CRSs", ()
   assert.ok(webgl.bufferUploads[0].every(Number.isFinite));
   layer.render(webgl.context, new Array(16).fill(0));
   assert.equal(webgl.drawCalls(), 1);
+  assert.equal(webgl.drawVertexCounts()[0], webgl.bufferUploads[0].length / 11);
   fallback.remove();
   layer.onRemove(otherCrs.map, webgl.context);
 
@@ -867,6 +871,7 @@ test("shader projected grids support EPSG:3857 and arbitrary projected CRSs", ()
     { globeClippingPlane: [0, 0, 1, 0] },
   );
   assert.equal(globeWebgl.drawCalls(), 1);
+  assert.equal(globeWebgl.drawVertexCounts()[0], globeWebgl.bufferUploads[0].length / 11);
   assert.equal(globeWebgl.uniform1Values.get("u_globe_clipping_active"), 1);
   globeGrid.remove();
 });
