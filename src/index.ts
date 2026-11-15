@@ -49,11 +49,17 @@ export {
 } from "./map/grid-tile-protocol";
 export type {
   ShaderGridHandle,
+  ShaderGridLayerUpdate,
   ShaderGridOptions,
   ShaderGridStyleUpdate,
   ShaderProjectedGridOptions,
+  ShaderTilePixelGridOptions,
 } from "./map/shader-grid";
-export { addShaderBBoxGrid, addShaderProjectedGrid } from "./map/shader-grid";
+export {
+  addShaderBBoxGrid,
+  addShaderProjectedGrid,
+  addShaderTilePixelGrid,
+} from "./map/shader-grid";
 export type {
   AddGridOptions,
   AddGridSettings,

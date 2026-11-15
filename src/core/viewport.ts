@@ -1,4 +1,4 @@
-import { DEFAULT_MAX_LINES, DEFAULT_VIEWPORT_PADDING } from "../constants";
+import { DEFAULT_VIEWPORT_PADDING } from "../constants";
 import { GridError } from "../errors";
 import type { BBox, LineFeature, LineFeatureCollection, ViewportOptions } from "../types";
 import { lineFeature } from "./features";
@@ -176,11 +176,11 @@ function viewportLinesFromAxes(
   view: BBox,
   options: ViewportOptions,
 ): LineFeatureCollection {
-  const { padding = DEFAULT_VIEWPORT_PADDING, maxLines = DEFAULT_MAX_LINES } = options;
+  const { padding = DEFAULT_VIEWPORT_PADDING, maxLines } = options;
   if (!Number.isFinite(padding) || padding < 0) {
     throw new GridError("viewport padding must be >= 0");
   }
-  if (!Number.isInteger(maxLines) || maxLines < 1) {
+  if (maxLines !== undefined && (!Number.isInteger(maxLines) || maxLines < 1)) {
     throw new GridError("viewport maxLines must be a positive integer");
   }
 
@@ -196,7 +196,7 @@ function viewportLinesFromAxes(
   const yLast = upperIndex(ys, north);
 
   const visibleCount = xLast - xFirst + 1 + (yLast - yFirst + 1);
-  const stride = Math.max(1, Math.ceil(visibleCount / maxLines));
+  const stride = maxLines === undefined ? 1 : Math.max(1, Math.ceil(visibleCount / maxLines));
 
   const features: LineFeature[] = [];
   const spanSouth = roundCoord(south);

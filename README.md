@@ -116,10 +116,7 @@ the browser. The tile generator works for both geographic and projected grids, a
 continue to use Mapbox/MapLibre's normal projection and layer rendering.
 
 ```ts
-import {
-  addVectorGridTileLayer,
-  createBBoxGridTileGenerator,
-} from "@jack_rogers/mapbox-bbox-grid";
+import { addVectorGridTileLayer, createBBoxGridTileGenerator } from "@jack_rogers/mapbox-bbox-grid";
 
 // On your tile server, create this once and serve its output at /grid/{z}/{x}/{y}.pbf.
 const tileGenerator = createBBoxGridTileGenerator({
@@ -175,10 +172,15 @@ devices, prefer generating tiles on a server and let the map cache the requested
 ## WebGL shader grids
 
 For regular grids that need no per-line feature properties, use a custom WebGL layer to calculate
-line coverage in the fragment shader instead of creating GeoJSON or tile geometry:
+line coverage in the fragment shader instead of generating grid-line GeoJSON or vector-tile
+geometry:
 
 ```ts
-import { addShaderBBoxGrid, addShaderProjectedGrid } from "@jack_rogers/mapbox-bbox-grid";
+import {
+  addShaderBBoxGrid,
+  addShaderProjectedGrid,
+  addShaderTilePixelGrid,
+} from "@jack_rogers/mapbox-bbox-grid";
 
 const shaderGrid = addShaderBBoxGrid(map, {
   bbox: [-2.7, 51.4, -2.5, 51.5],
@@ -192,24 +194,37 @@ shaderGrid.show();
 shaderGrid.update({ lineWidth: 2 });
 shaderGrid.remove();
 
-// EPSG:3857 uses a geometry-free fragment shader; other projected CRSs
+// EPSG:3857 uses a fragment-shader lattice; other projected CRSs
 // use Proj4 to prepare a WebGL line mesh:
-const projectedShaderGrid = addShaderProjectedGrid(
-  map,
-  [400_000, 100_000, 500_000, 200_000],
-  { crs: "EPSG:32631", resolution: 10_000, maxLines: 1000 },
-);
+const projectedShaderGrid = addShaderProjectedGrid(map, [400_000, 100_000, 500_000, 200_000], {
+  crs: "EPSG:32631",
+  resolution: 10_000,
+  maxLines: 1000,
+});
+
+const tilePixelShaderGrid = addShaderTilePixelGrid(map, mercatorBounds, {
+  zoom: 12,
+  tileSize: 256,
+});
 ```
 
-Shader grids use a Mapbox/MapLibre custom layer and require the map's Mercator projection. The
-geographic API supports the same geographic degree/metric grid spacing as `addBBoxGrid`. Projected
-grids use the supplied Proj4 CRS and native linear units. EPSG:3857 uses the geometry-free
-fragment-shader lattice. Other projected CRSs are transformed with Proj4 and rendered as screen-space
-WebGL line meshes, avoiding Mapbox GeoJSON source tiling while retaining CRS-aligned line positions.
-This path prepares mesh geometry on the CPU, so its work and memory grow with line count; set
-`maxLines` to reject grids that would exceed a chosen line count. Supplying `maxLines` selects this
-bounded mesh path even for EPSG:3857. For non-Mercator map projections, the default `fallback: "geojson"`
-uses the existing GeoJSON renderer. Set `fallback: "error"` to reject unsupported map projections.
+Shader grids use a Mapbox/MapLibre custom layer and render directly on Mercator and globe
+projections. On globe, the shader path builds a tessellated surface mesh, maps vertices into Mapbox's
+globe coordinate space, clips the far side of the globe, and follows Mapbox's globe-to-Mercator
+zoom transition. Other projections use the viewport-aware GeoJSON fallback (or throw with
+`fallback: "error"`). The geographic API supports the same degree/metric grid spacing as
+`addBBoxGrid`. Projected grids use the supplied Proj4 CRS and native linear units. EPSG:3857 uses a
+fragment-shader lattice. Other projected CRSs are transformed with Proj4 and rendered as
+screen-space WebGL line meshes. WebGL paths use coordinates relative to CPU-computed reference
+points to reduce float precision loss at fine resolutions.
+
+Unsupported-projection fallback uses viewport generation by default, updates on map movement, and
+logs a warning; set `viewport: false` to request full-grid GeoJSON generation. The returned handle's
+`renderer` property identifies `"webgl"` or `"geojson"`. Set `fallback: "error"` to reject projection
+fallback. `maxLines` is opt-in and throws only when the projected WebGL mesh exceeds that limit; it
+does not impose a default line cap. `addShaderTilePixelGrid` derives the Web Mercator pixel spacing
+and origin from `zoom` and `tileSize`. The shader handle can update `lineColor`, `lineWidth`,
+`lineOpacity`, `beforeId`, `minzoom`, `maxzoom` and `slot`.
 
 Shader styling is intentionally limited to solid `#rgb` or `#rrggbb` colors, positive line widths,
 and opacity from 0 to 1. It does not support Mapbox paint expressions, per-line feature properties,
@@ -218,17 +233,17 @@ Shader grids still use GPU work across the map viewport; benchmark dense grids o
 
 ## Options
 
-| Option                                     | Meaning                                                                                                                                                     |
-| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `bbox`                                     | `[west, south, east, north]` in degrees                                                                                                                     |
-| `resolution`                               | cell size: `number` or `[x, y]`                                                                                                                             |
-| `units`                                    | `"degrees"` (default), `"metres"`, `"kilometres"`; US spellings `"meters"` and `"kilometers"` are also accepted                                             |
-| `geodesic`                                 | `true` (default for metric resolutions): use a WGS84 ellipsoid approximation for metric-to-degree conversion; `false` keeps the legacy flat-Earth behaviour |
-| `cells`                                    | instead of `resolution`: `[cols, rows]` or one number                                                                                                       |
-| `mode`                                     | `"lines"` (default, efficient) or `"cells"` (per-cell properties)                                                                                           |
-| `viewport`                                 | `true` or `{ padding, maxLines, minSpacingPx }`: draw only the visible area and thin dense lines                                                            |
-| `id`, `paint`, `layout`, `beforeId`, `minzoom`, `maxzoom`, `slot`, `fit` | layer id, styling, layer order, zoom range, Standard style slot, fit-to-bbox |
-| `maxCells`                                 | optional safety limit on cell count for full-grid output; unset by default and not applied in viewport mode                                                  |
+| Option                                                                   | Meaning                                                                                                                                                     |
+| ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bbox`                                                                   | `[west, south, east, north]` in degrees                                                                                                                     |
+| `resolution`                                                             | cell size: `number` or `[x, y]`                                                                                                                             |
+| `units`                                                                  | `"degrees"` (default), `"metres"`, `"kilometres"`; US spellings `"meters"` and `"kilometers"` are also accepted                                             |
+| `geodesic`                                                               | `true` (default for metric resolutions): use a WGS84 ellipsoid approximation for metric-to-degree conversion; `false` keeps the legacy flat-Earth behaviour |
+| `cells`                                                                  | instead of `resolution`: `[cols, rows]` or one number                                                                                                       |
+| `mode`                                                                   | `"lines"` (default, efficient) or `"cells"` (per-cell properties)                                                                                           |
+| `viewport`                                                               | `true` or `{ padding, maxLines, minSpacingPx }`: draw only visible lines; `maxLines` is optional and thins only when supplied                               |
+| `id`, `paint`, `layout`, `beforeId`, `minzoom`, `maxzoom`, `slot`, `fit` | layer id, styling, layer order, zoom range, Standard style slot, fit-to-bbox                                                                                |
+| `maxCells`                                                               | optional safety limit on cell count for full-grid output; unset by default and not applied in viewport mode                                                 |
 
 TypeScript callers must specify exactly one of `resolution` or `cells`. The bounding box is a four-number tuple, and viewport mode cannot be combined with cell mode. Runtime validation remains for invalid numeric values and untyped JavaScript callers.
 
@@ -257,7 +272,9 @@ import { installProjectedGridWorker } from "@jack_rogers/mapbox-bbox-grid";
 installProjectedGridWorker(self);
 
 // app.ts
-const worker = new Worker(new URL("./projected-grid.worker.ts", import.meta.url), { type: "module" });
+const worker = new Worker(new URL("./projected-grid.worker.ts", import.meta.url), {
+  type: "module",
+});
 const grid = addProjectedGrid(map, chartBounds, {
   crs: "EPSG:32631",
   resolution: 20,
@@ -270,16 +287,16 @@ const grid = addProjectedGrid(map, chartBounds, {
 ## Performance
 
 - Use `mode: "lines"` (the default) for visuals. Geographic grids create one feature per grid line; projected grids group lines into one MultiLineString feature per axis.
-- For large areas or fine resolutions turn on `viewport: true`. It finds visible line indices directly from the grid steps, without creating or retaining tick arrays for the full bbox. Only visible lines (plus padding) are generated; after a pan/zoom, the source is updated on `moveend`. When more than `maxLines` (default 1000) would be visible, every n-th line is drawn instead. Lines stay on the real grid and never shift while panning. This works with `lines` mode only.
+- For large areas or fine resolutions turn on `viewport: true`. It finds visible line indices directly from the grid steps, without creating or retaining tick arrays for the full bbox. Only visible lines (plus padding) are generated; after a pan/zoom, the source is updated on `moveend`. By default all visible lines are drawn. Set `maxLines` to thin by whole grid-index multiples when you want a limit. Lines stay on the real grid and never shift while panning. This works with `lines` mode only.
 - Map overlays can use `viewport: { minSpacingPx: 4 }` to thin lines by their screen-space separation while keeping them aligned to whole grid-index multiples. It requires `map.project()`, measures line spacing at representative points, and keeps viewport boundary lines. An explicit `maxLines` remains an additional upper bound; pixel spacing is a target rather than a guarantee under pitch, rotation, or strongly curved projected grids.
-- In viewport mode, memory and GeoJSON work are proportional to the displayed lines rather than the total grid size. `maxLines` is a target; bbox border lines can add a small number beyond it.
+- In viewport mode, memory and GeoJSON work are proportional to the displayed lines rather than the total grid size. `maxLines` is opt-in; bbox border lines can add a small number beyond it.
 - The grid dimensions (`cols`, `rows`, `cellCount`) are inexpensive to read. Accessing `xs`/`ys`, or requesting full output with `lines()`, `cells()`, `createGrid()` or `toGeoJSON()`, materializes or returns the entire grid. Those APIs can use substantial time and memory for fine resolutions or large extents. Use viewport mode for map display and set `maxCells` when producing full-grid output.
 - Cell mode creates one feature per cell with duplicated shared edges, so avoid it for large grids unless per-cell properties are needed. A `maxCells` limit applies to full-grid generation, not viewport rendering.
 - `addProjectedGrid` accepts `viewport: true` or `{ padding, maxLines }` to generate visible lines only. It refreshes on `moveend`, skips unchanged snapped views, and thins by whole multiples of the resolution, so lines remain on the original CRS grid. Its optional top-level `maxLines` limits full-grid output; viewport mode uses its own `viewport.maxLines` as a thinning target instead of failing.
 - `createBBoxGridTileGenerator` and `createProjectedGridTileGenerator` generate MVT data on demand per XYZ request, with a default cap of 1000 lines per tile. Serve those bytes from an HTTP tile endpoint for Mapbox GL JS; its vector source cache handles repeat tile requests. Tile generation itself still costs CPU on a cache miss, so coarser grids or a server-side cache may be appropriate for very dense grids.
 - Grid transforms are cached for viewport refreshes. EPSG:3857 lines use two vertices by default; other projected grids densify curved lines for display. `addTilePixelGrid` derives the EPSG:3857 origin and pixel spacing from zoom and tile size.
-- Projected shader grids outside EPSG:3857 use Proj4 to build a WebGL mesh. Set `maxLines` when the CRS bounds or resolution could produce a dense grid.
-- The optional worker moves projected GeoJSON generation off the main thread; it does not change Mapbox's GeoJSON source tiling or line-rendering cost. Shader rendering and on-demand vector-tile sources are not provided.
+- Projected shader grids outside EPSG:3857 use Proj4 to build a WebGL mesh, including on globe projections. Set `maxLines` when the CRS bounds or resolution could produce a dense grid.
+- The optional worker moves projected GeoJSON generation off the main thread; it does not change Mapbox's GeoJSON source tiling or line-rendering cost. Shader rendering and on-demand vector-tile sources are available as separate map-overlay options.
 - Default line width and opacity fade with zoom so far-out views stay light.
 
 ## Notes

@@ -55,8 +55,8 @@ export interface ViewportOptions {
   /** Extra area drawn around the view, as a fraction of its size. Default 0.25. */
   padding?: number;
   /**
-   * Upper bound on the number of lines drawn at once. When more lines would be visible, every
-   * n-th grid line is drawn instead (still aligned to the real grid). Default 1000.
+   * Optional upper bound on the number of lines drawn at once. When more lines would be visible,
+   * every n-th grid line is drawn instead (still aligned to the real grid). Unset by default.
    */
   maxLines?: number;
 }
@@ -222,6 +222,8 @@ export interface MapLike {
   project?(coordinate: [number, number]): { x: number; y: number };
   /** Current map projection, when exposed by the map implementation. */
   getProjection?(): { name?: string };
+  /** Current zoom level, used to honor custom-layer zoom ranges. */
+  getZoom?(): number;
   /** Request another render frame for a custom WebGL layer. */
   triggerRepaint?(): void;
   /** Device-pixel ratio used by the map renderer. */

@@ -11,7 +11,6 @@ export const COORD_SCALE = 1e8;
 export const DEFAULT_LAYER_ID = "bboxgrid";
 
 /** Default cap on lines drawn at once in viewport mode. */
-export const DEFAULT_MAX_LINES = 1000;
 
 /** Default viewport padding, as a fraction of the visible size. */
 export const DEFAULT_VIEWPORT_PADDING = 0.25;
