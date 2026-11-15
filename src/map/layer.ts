@@ -1,4 +1,4 @@
-import { DEFAULT_FIT_PADDING_PX, DEFAULT_MAX_LINES } from "../constants";
+import { DEFAULT_FIT_PADDING_PX } from "../constants";
 import { GridError } from "../errors";
 import type {
   BBox,
@@ -94,7 +94,7 @@ export function viewportGenerationOptions(
     ...generationOptions,
     maxLines:
       generationOptions.maxLines === undefined
-        ? Math.max(DEFAULT_MAX_LINES, pixelBudget)
+        ? pixelBudget
         : Math.min(generationOptions.maxLines, pixelBudget),
   };
 }

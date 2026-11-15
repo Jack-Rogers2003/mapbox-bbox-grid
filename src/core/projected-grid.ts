@@ -1,5 +1,4 @@
 import proj4 from "proj4";
-import { DEFAULT_MAX_LINES } from "../constants";
 import { GridError } from "../errors";
 import type {
   BBox,
@@ -640,11 +639,11 @@ export function createProjectedGridFromBoundsFactory(
   return {
     full: () => generate(polygon),
     viewport: (view, viewportOptions = {}) => {
-      const { padding = 0.25, maxLines = DEFAULT_MAX_LINES } = viewportOptions;
+      const { padding = 0.25, maxLines } = viewportOptions;
       if (!Number.isFinite(padding) || padding < 0) {
         throw new GridError("viewport padding must be >= 0");
       }
-      if (!Number.isInteger(maxLines) || maxLines < 1) {
+      if (maxLines !== undefined && (!Number.isInteger(maxLines) || maxLines < 1)) {
         throw new GridError("viewport maxLines must be a positive integer");
       }
       if (
@@ -689,7 +688,7 @@ export function createProjectedGridFromBoundsFactory(
       if (!Number.isSafeInteger(candidateCount)) {
         throw new GridError("viewport line count exceeds the safe integer range");
       }
-      const stride = Math.max(1, Math.ceil(candidateCount / maxLines));
+      const stride = maxLines === undefined ? 1 : Math.max(1, Math.ceil(candidateCount / maxLines));
       return generate(projectedView, stride, true);
     },
   };

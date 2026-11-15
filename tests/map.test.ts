@@ -13,6 +13,7 @@ import {
   addProjectedGrid,
   addShaderBBoxGrid,
   addShaderProjectedGrid,
+  addShaderTilePixelGrid,
   addTilePixelGrid,
   addVectorGridTileLayer,
   createBBoxGridTileGenerator,
@@ -41,12 +42,14 @@ function createFakeMap(
     bounds?: BBox;
     pixelsPerDegree?: number;
     projection?: string;
+    zoom?: number;
   } = {},
 ) {
   const sources = new Map<string, FakeSource>();
   const layers = new Map<string, Record<string, unknown>>();
   const moveEndListeners = new Set<() => void>();
   const contextRestoredListeners = new Set<() => void>();
+  const contextLostListeners = new Set<() => void>();
   const log: string[] = [];
   let loadListener: (() => void) | undefined;
   let bounds: BBox = options.bounds ?? [-180, -90, 180, 90];
@@ -99,6 +102,8 @@ function createFakeMap(
     on(type, listener) {
       if (type === "webglcontextrestored") {
         contextRestoredListeners.add(listener);
+      } else if (type === "webglcontextlost") {
+        contextLostListeners.add(listener);
       } else {
         moveEndListeners.add(listener);
       }
@@ -106,6 +111,8 @@ function createFakeMap(
     off(type, listener) {
       if (type === "webglcontextrestored") {
         contextRestoredListeners.delete(listener);
+      } else if (type === "webglcontextlost") {
+        contextLostListeners.delete(listener);
       } else {
         moveEndListeners.delete(listener);
       }
@@ -121,6 +128,7 @@ function createFakeMap(
       return { x: coordinate[0] * scale, y: coordinate[1] * scale };
     },
     getProjection: () => ({ name: options.projection ?? "mercator" }),
+    getZoom: () => options.zoom ?? 5,
     triggerRepaint() {
       log.push("triggerRepaint");
     },
@@ -136,6 +144,7 @@ function createFakeMap(
     log,
     moveEndListeners,
     contextRestoredListeners,
+    contextLostListeners,
     fireLoad: () => loadListener?.(),
     moveTo(next: BBox) {
       bounds = next;
@@ -150,6 +159,11 @@ function createFakeMap(
 function createFakeWebGLContext() {
   let drawCalls = 0;
   const shaderSources: string[] = [];
+  const bufferUploads: number[][] = [];
+  const uniform2Values = new Map<string, [number, number]>();
+  const uniform1Values = new Map<string, number>();
+  const uniform4Values = new Map<string, [number, number, number, number]>();
+  const matrixUploads: number[][] = [];
   const context = {
     VERTEX_SHADER: 1,
     FRAGMENT_SHADER: 2,
@@ -199,11 +213,13 @@ function createFakeWebGLContext() {
     getProgramInfoLog: () => null,
     deleteProgram() {},
     getAttribLocation: (_program: object, name: string) =>
-      name === "a_other" ? 1 : name === "a_side" ? 2 : 0,
-    getUniformLocation: () => ({}),
+      ["a_pos", "a_other", "a_side", "a_globe_pos", "a_globe_other", "a_grid"].indexOf(name),
+    getUniformLocation: (_program: object, name: string) => ({ name }),
     createBuffer: () => ({}),
     bindBuffer() {},
-    bufferData() {},
+    bufferData(_target: number, data: Float32Array) {
+      bufferUploads.push([...data]);
+    },
     deleteBuffer() {},
     getVertexAttrib: (_index: number, parameter: number) => {
       if (parameter === 20) {
@@ -237,16 +253,33 @@ function createFakeWebGLContext() {
     vertexAttribPointer() {},
     enableVertexAttribArray() {},
     disableVertexAttribArray() {},
-    uniformMatrix4fv() {},
-    uniform4f() {},
-    uniform2f() {},
+    uniformMatrix4fv(_location: object, _transpose: boolean, value: Float32Array) {
+      matrixUploads.push([...value]);
+    },
+    uniform4f(location: { name: string }, x: number, y: number, z: number, w: number) {
+      uniform4Values.set(location.name, [x, y, z, w]);
+    },
+    uniform2f(location: { name: string }, x: number, y: number) {
+      uniform2Values.set(location.name, [x, y]);
+    },
     uniform1i() {},
-    uniform1f() {},
+    uniform1f(location: { name: string }, value: number) {
+      uniform1Values.set(location.name, value);
+    },
     drawArrays() {
       drawCalls += 1;
     },
   };
-  return { context, drawCalls: () => drawCalls, shaderSources };
+  return {
+    context,
+    drawCalls: () => drawCalls,
+    shaderSources,
+    bufferUploads,
+    uniform2Values,
+    uniform1Values,
+    uniform4Values,
+    matrixUploads,
+  };
 }
 
 /**
@@ -457,7 +490,7 @@ test("viewport mode lifts the cell cap for lines", () => {
     viewport: true,
   });
   assert.ok(handle.grid.cols > 5000);
-  assert.ok(dataOf(fake).features.length <= 1000);
+  assert.ok(dataOf(fake).features.length > 2000);
 });
 
 test("viewport mode rejects cells mode", () => {
@@ -595,6 +628,8 @@ test("shader bbox grid renders with a custom WebGL layer", () => {
   assert.ok(webgl.shaderSources.some((source) => source.includes("out vec4 fragColor")));
   layer.render(webgl.context, new Array(16).fill(0));
   assert.equal(webgl.drawCalls(), 1);
+  assert.equal(webgl.bufferUploads[0].length % 13, 0);
+  assert.ok(webgl.bufferUploads[0].every(Number.isFinite));
   assert.equal(fake.contextRestoredListeners.size, 1);
   handle.update({ lineWidth: 2 });
   assert.ok(fake.log.includes("triggerRepaint"));
@@ -604,15 +639,160 @@ test("shader bbox grid renders with a custom WebGL layer", () => {
   layer.onRemove(fake.map, webgl.context);
 });
 
-test("shader bbox grid falls back to GeoJSON for non-Mercator map projections", () => {
+test("shader projected grids keep fine-resolution alignment relative to the bounds origin", () => {
+  const fake = createFakeMap({ projection: "mercator" });
+  const handle = addShaderProjectedGrid(fake.map, [400_000, 100_000, 500_000, 200_000], {
+    crs: "EPSG:3857",
+    resolution: 4.78,
+    origin: [399_990, 99_990],
+  });
+  const rawLayer = fake.layers.get("bboxgrid");
+  assert.ok(rawLayer);
+  if (!rawLayer) throw new Error("custom shader layer missing");
+  const layer = rawLayer as unknown as {
+    onAdd(map: unknown, gl: unknown): void;
+    render(gl: unknown, matrix: number[]): void;
+  };
+  const webgl = createFakeWebGLContext();
+  layer.onAdd(fake.map, webgl.context);
+  layer.render(
+    webgl.context,
+    Array.from({ length: 16 }, (_, index) => (index % 5 === 0 ? 1 : 0)),
+  );
+  const originPhase = (origin: number, anchor: number, step: number) => {
+    const value = (anchor - origin) / step;
+    return value - Math.floor(value);
+  };
+  assert.deepEqual(webgl.uniform2Values.get("u_origin"), [
+    originPhase(399_990, 450_000, 4.78),
+    originPhase(99_990, 150_000, 4.78),
+  ]);
+  assert.ok(Math.abs(webgl.matrixUploads[0][12] - (450_000 / 40_075_016.685_578_49 + 0.5)) < 1e-6);
+  assert.ok(Math.abs(webgl.matrixUploads[0][13] - (0.5 - 150_000 / 40_075_016.685_578_49)) < 1e-6);
+  assert.equal(webgl.bufferUploads[0].length % 13, 0);
+  assert.ok(webgl.bufferUploads[0].every(Number.isFinite));
+  handle.remove();
+});
+
+test("shader tile-pixel helper derives Web Mercator origin and resolution", () => {
+  const fake = createFakeMap({ projection: "mercator" });
+  const helper = addShaderTilePixelGrid(fake.map, [-100_000, -100_000, 100_000, 100_000], {
+    zoom: 2,
+    tileSize: 512,
+  });
+  assert.equal(helper.renderer, "webgl");
+  const rawLayer = fake.layers.get("bboxgrid");
+  assert.ok(rawLayer);
+  if (!rawLayer) throw new Error("custom shader layer missing");
+  const layer = rawLayer as unknown as {
+    onAdd(map: unknown, gl: unknown): void;
+    render(gl: unknown, matrix: number[]): void;
+  };
+  const webgl = createFakeWebGLContext();
+  layer.onAdd(fake.map, webgl.context);
+  layer.render(webgl.context, new Array(16).fill(0));
+  assert.deepEqual(webgl.uniform2Values.get("u_steps"), [
+    40_075_016.685_578_49 / (512 * 2 ** 2),
+    40_075_016.685_578_49 / (512 * 2 ** 2),
+  ]);
+  assert.deepEqual(webgl.uniform2Values.get("u_origin"), [0, 0]);
+  helper.remove();
+});
+
+test("shader layer handles update zoom, slot and placement settings", () => {
+  const fake = createFakeMap({ projection: "mercator", zoom: 8 });
+  const handle = addShaderBBoxGrid(fake.map, {
+    bbox: [-2, 50, 2, 54],
+    resolution: 0.1,
+    minzoom: 5,
+    maxzoom: 10,
+    slot: "middle",
+  });
+  const rawLayer = fake.layers.get("bboxgrid");
+  assert.ok(rawLayer);
+  if (!rawLayer) throw new Error("custom shader layer missing");
+  const layer = rawLayer as unknown as {
+    onAdd(map: unknown, gl: unknown): void;
+    render(gl: unknown, matrix: number[]): void;
+  };
+  const webgl = createFakeWebGLContext();
+  layer.onAdd(fake.map, webgl.context);
+  layer.render(webgl.context, new Array(16).fill(0));
+  assert.equal(webgl.drawCalls(), 1);
+  handle.update({ minzoom: 9, maxzoom: 11, slot: "top", beforeId: "labels" });
+  assert.ok(fake.log.includes("setSlot top"));
+  assert.ok(fake.log.includes("moveLayer labels"));
+  layer.render(webgl.context, new Array(16).fill(0));
+  assert.equal(webgl.drawCalls(), 1, "new minzoom suppresses drawing at zoom 8");
+  handle.remove();
+});
+
+test("shader bbox grid renders directly on the globe with Mapbox projection data", () => {
   const fake = createFakeMap({ projection: "globe" });
   const handle = addShaderBBoxGrid(fake.map, {
     bbox: [-2, 50, 2, 54],
     resolution: 1,
   });
-  assert.equal(handle.renderer, "geojson");
-  assert.equal(fake.layers.get("bboxgrid")?.type, "line");
+  assert.equal(handle.renderer, "webgl");
+  const rawLayer = fake.layers.get("bboxgrid");
+  assert.ok(rawLayer);
+  if (!rawLayer) throw new Error("custom shader layer missing");
+  const layer = rawLayer as unknown as {
+    onAdd(map: unknown, gl: unknown): void;
+    render(
+      gl: unknown,
+      matrix: number[],
+      projection: { name: string },
+      projectionToMercatorMatrix: number[],
+      transition: number,
+      centerInMercator: number[],
+      pixelsPerMeterRatio: number,
+      renderParameters: { globeClippingPlane: [number, number, number, number] },
+    ): void;
+  };
+  const webgl = createFakeWebGLContext();
+  layer.onAdd(fake.map, webgl.context);
+  const identity = Array.from({ length: 16 }, (_, index) => (index % 5 === 0 ? 1 : 0));
+  layer.render(webgl.context, identity, { name: "globe" }, identity, 0.25, [0, 0, 0], 1, {
+    globeClippingPlane: [0, 0, 1, 0],
+  });
+  assert.equal(webgl.drawCalls(), 1);
+  assert.equal(webgl.uniform1Values.get("u_transition"), 0.25);
+  assert.equal(webgl.uniform1Values.get("u_globe_clipping_active"), 1);
+  assert.equal(webgl.matrixUploads.length, 2);
+  assert.notDeepEqual(webgl.matrixUploads[0], webgl.matrixUploads[1]);
   handle.remove();
+
+  const polarMap = createFakeMap({ projection: "globe" });
+  const polarGrid = addShaderBBoxGrid(polarMap.map, {
+    bbox: [-1, 85, 1, 90],
+    resolution: 1,
+  });
+  const polarLayer = polarMap.layers.get("bboxgrid") as unknown as {
+    onAdd(map: unknown, gl: unknown): void;
+  };
+  const polarWebgl = createFakeWebGLContext();
+  polarLayer.onAdd(polarMap.map, polarWebgl.context);
+  const radius = 8192 / (2 * Math.PI);
+  const toEcef = (longitude: number, latitude: number): [number, number, number] => {
+    const longitudeRadians = (longitude * Math.PI) / 180;
+    const latitudeRadians = (latitude * Math.PI) / 180;
+    return [
+      Math.cos(latitudeRadians) * Math.sin(longitudeRadians) * radius,
+      -Math.sin(latitudeRadians) * radius,
+      Math.cos(latitudeRadians) * Math.cos(longitudeRadians) * radius,
+    ];
+  };
+  const point = toEcef(-1, 85);
+  const reference = toEcef(0, 87.5);
+  assert.equal(polarWebgl.bufferUploads[0][11], -1);
+  assert.equal(polarWebgl.bufferUploads[0][12], -2.5);
+  for (let axis = 0; axis < 3; axis += 1) {
+    assert.ok(
+      Math.abs(polarWebgl.bufferUploads[0][5 + axis] - (point[axis] - reference[axis])) < 1e-4,
+    );
+  }
+  polarGrid.remove();
 });
 
 test("shader projected grids support EPSG:3857 and arbitrary projected CRSs", () => {
@@ -644,20 +824,51 @@ test("shader projected grids support EPSG:3857 and arbitrary projected CRSs", ()
   const webgl = createFakeWebGLContext();
   layer.onAdd(otherCrs.map, webgl.context);
   assert.ok(webgl.shaderSources.some((source) => source.includes("a_other")));
+  assert.equal(webgl.bufferUploads[0].length % 11, 0);
+  assert.ok(webgl.bufferUploads[0].every(Number.isFinite));
   layer.render(webgl.context, new Array(16).fill(0));
   assert.equal(webgl.drawCalls(), 1);
   fallback.remove();
   layer.onRemove(otherCrs.map, webgl.context);
 
-  const nonMercator = createFakeMap({ projection: "globe" });
-  const mapFallback = addShaderProjectedGrid(
-    nonMercator.map,
-    [400_000, 100_000, 500_000, 200_000],
-    { crs: "EPSG:32631", resolution: 20_000 },
+  const globe = createFakeMap({ projection: "globe" });
+  const globeGrid = addShaderProjectedGrid(globe.map, [400_000, 100_000, 500_000, 200_000], {
+    crs: "EPSG:32631",
+    resolution: 20_000,
+  });
+  assert.equal(globeGrid.renderer, "webgl");
+  const globeLayer = globe.layers.get("bboxgrid");
+  assert.ok(globeLayer);
+  if (!globeLayer) throw new Error("custom globe projected layer missing");
+  const globeWebgl = createFakeWebGLContext();
+  const globeCustomLayer = globeLayer as unknown as {
+    onAdd(map: unknown, gl: unknown): void;
+    render(
+      gl: unknown,
+      matrix: number[],
+      projection: { name: string },
+      projectionToMercatorMatrix: number[],
+      transition: number,
+      centerInMercator: number[],
+      pixelsPerMeterRatio: number,
+      renderParameters: { globeClippingPlane: [number, number, number, number] },
+    ): void;
+  };
+  globeCustomLayer.onAdd(globe.map, globeWebgl.context);
+  const identity = Array.from({ length: 16 }, (_, index) => (index % 5 === 0 ? 1 : 0));
+  globeCustomLayer.render(
+    globeWebgl.context,
+    identity,
+    { name: "globe" },
+    identity,
+    0,
+    [0, 0, 0],
+    1,
+    { globeClippingPlane: [0, 0, 1, 0] },
   );
-  assert.equal(mapFallback.renderer, "geojson");
-  assert.equal(nonMercator.layers.get("bboxgrid")?.type, "line");
-  mapFallback.remove();
+  assert.equal(globeWebgl.drawCalls(), 1);
+  assert.equal(globeWebgl.uniform1Values.get("u_globe_clipping_active"), 1);
+  globeGrid.remove();
 });
 
 test("on-demand bbox vector tiles return MVT and remove cleanly", async () => {

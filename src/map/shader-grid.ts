@@ -8,6 +8,7 @@ import type {
   CellCounts,
   GridSettings,
   MapLike,
+  MapViewportOptions,
   ProjectedBounds,
   Resolution,
 } from "../types";
@@ -25,7 +26,9 @@ type ShaderGridShape = GridSettings &
 /** Options for drawing a geographic grid directly in a WebGL fragment shader. */
 export type ShaderGridOptions = Omit<AddGridSettings, "paint" | "layout" | "maxCells"> &
   ShaderGridShape & {
-    /** Fallback renderer for non-Mercator maps. Defaults to `"geojson"`. */
+    /** Viewport-limited GeoJSON fallback settings for unsupported projections; defaults to `true`. */
+    viewport?: boolean | MapViewportOptions;
+    /** Fallback renderer for projections other than Mercator and globe. Defaults to `"geojson"`. */
     fallback?: "geojson" | "error";
     /** Solid CSS hex color. Default `"#e63946"`. */
     lineColor?: string;
@@ -40,12 +43,18 @@ export type ShaderGridStyleUpdate = Partial<
   Pick<ShaderGridOptions, "lineColor" | "lineWidth" | "lineOpacity">
 >;
 
+/** Mutable layer placement and zoom settings accepted by a shader-grid handle. */
+export type ShaderGridLayerUpdate = Pick<
+  ShaderGridOptions,
+  "beforeId" | "minzoom" | "maxzoom" | "slot"
+>;
+
 /** Handle for a shader grid or its GeoJSON fallback. */
 export interface ShaderGridHandle {
   /** Renderer currently in use. */
   readonly renderer: "webgl" | "geojson";
   /** Update shader line styling. */
-  update(options: ShaderGridStyleUpdate): void;
+  update(options: ShaderGridStyleUpdate & ShaderGridLayerUpdate): void;
   /** Show the grid. */
   show(): void;
   /** Hide the grid. */
@@ -54,32 +63,78 @@ export interface ShaderGridHandle {
   remove(): void;
 }
 
-/** Options for a WebGL shader grid in EPSG:3857 coordinates. */
+/** Apply mutable placement and zoom settings to a shader layer. */
+function updateLayerSettings(
+  map: MapLike,
+  id: string,
+  settings: ShaderGridLayerUpdate,
+  updateZoom: (minzoom: number | undefined, maxzoom: number | undefined) => void,
+): void {
+  if (settings.minzoom !== undefined || settings.maxzoom !== undefined) {
+    updateZoom(settings.minzoom, settings.maxzoom);
+  }
+  if (settings.slot !== undefined) {
+    if (!map.setSlot) {
+      throw new GridError("map does not support updating layer slots");
+    }
+    map.setSlot(id, settings.slot);
+  }
+  if (settings.beforeId !== undefined) {
+    if (!map.moveLayer) {
+      throw new GridError("map does not support updating layer placement");
+    }
+    map.moveLayer(id, settings.beforeId);
+  }
+}
+
+/** Options for a projected-CRS shader grid on Mercator or globe maps. */
 export type ShaderProjectedGridOptions = Omit<
   AddProjectedGridOptions,
   "worker" | "onWorkerError" | "viewport" | "paint" | "layout"
 > & {
   resolution: Resolution;
-  /** Optional mesh line limit; exceeding it throws. Supplying it uses the mesh renderer. */
+  /** Draw only currently visible lines in unsupported-projection fallback mode. */
+  viewport?: boolean | MapViewportOptions;
+  /** Optional mesh line limit; exceeding it throws. */
   maxLines?: number;
   /** Color, width and opacity for the shader path (hex color only). */
   lineColor?: string;
   lineWidth?: number;
   lineOpacity?: number;
-  /** Fallback renderer for non-Mercator map projections. Defaults to `"geojson"`. */
+  /** Fallback renderer for projections other than Mercator and globe. Defaults to `"geojson"`. */
   fallback?: "geojson" | "error";
+};
+
+/** Options for a Web Mercator grid aligned to a slippy-map tile-pixel lattice. */
+export type ShaderTilePixelGridOptions = Omit<
+  ShaderProjectedGridOptions,
+  "crs" | "origin" | "resolution"
+> & {
+  /** Web Mercator zoom level. */
+  zoom: number;
+  /** Tile width in pixels. Default `256`. */
+  tileSize?: number;
 };
 
 interface ShaderResources {
   program: object;
   buffer: object;
   position: number;
+  other: number;
+  side: number;
+  globePosition: number;
+  globeOther: number;
+  grid: number;
   matrix: object;
+  globeMatrix: object;
+  transition: object;
+  viewport: object;
   bbox: object;
   steps: object;
   origin: object;
-  projected: object;
   edgeBorders: object;
+  clippingPlane: object;
+  clippingActive: object;
   color: object;
   width: object;
   opacity: object;
@@ -165,13 +220,42 @@ interface ShaderGl {
   drawArrays(mode: number, first: number, count: number): void;
 }
 
+interface ShaderRenderParameters {
+  projectionMatrix?: ArrayLike<number>;
+  viewMatrix?: ArrayLike<number>;
+  globeClippingPlane?: readonly [number, number, number, number] | null;
+}
+
+type ShaderProjection = { name?: string };
+
 const VERTEX_SHADER = `
 attribute vec2 a_pos;
+attribute vec2 a_other;
+attribute float a_side;
+attribute vec3 a_globe_pos;
+attribute vec3 a_globe_other;
+attribute vec2 a_grid;
 uniform mat4 u_matrix;
-varying vec2 v_world;
+uniform mat4 u_globe_matrix;
+uniform float u_transition;
+uniform float u_line_width;
+uniform vec2 u_viewport;
+varying vec2 v_grid;
+varying vec3 v_globe;
 void main() {
-  v_world = a_pos;
-  gl_Position = u_matrix * vec4(a_pos, 0.0, 1.0);
+  v_grid = a_grid;
+  vec4 mercatorPosition = u_matrix * vec4(a_pos, 0.0, 1.0);
+  vec4 globePosition = u_globe_matrix * vec4(a_globe_pos, 1.0);
+  vec4 mercatorOther = u_matrix * vec4(a_other, 0.0, 1.0);
+  vec4 globeOther = u_globe_matrix * vec4(a_globe_other, 1.0);
+  vec4 position = mix(globePosition, mercatorPosition, u_transition);
+  vec4 other = mix(globeOther, mercatorOther, u_transition);
+  vec2 direction = (other.xy / max(other.w, 0.000001) - position.xy / max(position.w, 0.000001)) * u_viewport;
+  float magnitude = max(length(direction), 0.000001);
+  vec2 normal = vec2(-direction.y, direction.x) / magnitude;
+  position.xy += normal * a_side * u_line_width / u_viewport * position.w;
+  gl_Position = position;
+  v_globe = a_globe_pos;
 }`;
 
 const FRAGMENT_SHADER = `
@@ -180,12 +264,15 @@ precision highp float;
 uniform vec4 u_bbox;
 uniform vec2 u_steps;
 uniform vec2 u_origin;
-uniform int u_projected;
 uniform int u_edge_borders;
 uniform vec4 u_color;
 uniform float u_line_width;
 uniform float u_opacity;
-varying vec2 v_world;
+uniform vec4 u_globe_clipping_plane;
+uniform float u_globe_clipping_active;
+uniform float u_transition;
+varying vec2 v_grid;
+varying vec3 v_globe;
 
 float lineCoverage(float coordinate) {
   float distanceToLine = abs(fract(coordinate + 0.5) - 0.5);
@@ -195,23 +282,23 @@ float lineCoverage(float coordinate) {
 }
 
 void main() {
-  float xCoordinate = mod(v_world.x, 1.0) * 360.0 - 180.0;
-  float mercatorY = clamp(v_world.y, 0.000001, 0.999999);
-  float mercatorRadians = 3.141592653589793 * (1.0 - 2.0 * mercatorY);
-  float yCoordinate = degrees(atan(0.5 * (exp(mercatorRadians) - exp(-mercatorRadians))));
-  if (u_projected == 1) {
-    xCoordinate = mod(v_world.x, 1.0) * 40075016.68557849 - 20037508.342789244;
-    yCoordinate = (0.5 - v_world.y) * 40075016.68557849;
-  }
+  float xCoordinate = v_grid.x;
+  float yCoordinate = v_grid.y;
   float inside = step(u_bbox.x, xCoordinate) * step(xCoordinate, u_bbox.z)
     * step(u_bbox.y, yCoordinate) * step(yCoordinate, u_bbox.w);
-  float vertical = lineCoverage((xCoordinate - u_origin.x) / u_steps.x);
-  float horizontal = lineCoverage((yCoordinate - u_origin.y) / u_steps.y);
+  float vertical = lineCoverage(xCoordinate / u_steps.x + u_origin.x);
+  float horizontal = lineCoverage(yCoordinate / u_steps.y + u_origin.y);
   if (u_edge_borders == 1) {
     vertical = max(vertical, lineCoverage((xCoordinate - u_bbox.z) / u_steps.x));
     horizontal = max(horizontal, lineCoverage((yCoordinate - u_bbox.w) / u_steps.y));
   }
   float alpha = max(vertical, horizontal) * inside * u_opacity * u_color.a;
+  if (u_globe_clipping_active > 0.5 && u_transition < 1.0) {
+    float signedDistance = dot(u_globe_clipping_plane.xyz, v_globe)
+      + u_globe_clipping_plane.w;
+    float visibility = step(0.0, signedDistance);
+    alpha *= mix(visibility, 1.0, u_transition);
+  }
   if (alpha <= 0.001) {
     discard;
   }
@@ -278,23 +365,47 @@ function shaderSources(gl: ShaderGl): { vertex: string; fragment: string } {
   return {
     vertex: `#version 300 es
 in vec2 a_pos;
+in vec2 a_other;
+in float a_side;
+in vec3 a_globe_pos;
+in vec3 a_globe_other;
+in vec2 a_grid;
 uniform mat4 u_matrix;
-out vec2 v_world;
+uniform mat4 u_globe_matrix;
+uniform float u_transition;
+uniform float u_line_width;
+uniform vec2 u_viewport;
+out vec2 v_grid;
+out vec3 v_globe;
 void main() {
-  v_world = a_pos;
-  gl_Position = u_matrix * vec4(a_pos, 0.0, 1.0);
+  v_grid = a_grid;
+  vec4 mercatorPosition = u_matrix * vec4(a_pos, 0.0, 1.0);
+  vec4 globePosition = u_globe_matrix * vec4(a_globe_pos, 1.0);
+  vec4 mercatorOther = u_matrix * vec4(a_other, 0.0, 1.0);
+  vec4 globeOther = u_globe_matrix * vec4(a_globe_other, 1.0);
+  vec4 position = mix(globePosition, mercatorPosition, u_transition);
+  vec4 other = mix(globeOther, mercatorOther, u_transition);
+  vec2 direction = (other.xy / max(other.w, 0.000001) - position.xy / max(position.w, 0.000001)) * u_viewport;
+  float magnitude = max(length(direction), 0.000001);
+  vec2 normal = vec2(-direction.y, direction.x) / magnitude;
+  position.xy += normal * a_side * u_line_width / u_viewport * position.w;
+  gl_Position = position;
+  v_globe = a_globe_pos;
 }`,
     fragment: `#version 300 es
 precision highp float;
 uniform vec4 u_bbox;
 uniform vec2 u_steps;
 uniform vec2 u_origin;
-uniform int u_projected;
+uniform vec4 u_globe_clipping_plane;
+uniform float u_globe_clipping_active;
+uniform float u_transition;
 uniform int u_edge_borders;
 uniform vec4 u_color;
 uniform float u_line_width;
 uniform float u_opacity;
-in vec2 v_world;
+in vec2 v_grid;
+in vec3 v_globe;
 out vec4 fragColor;
 ${FRAGMENT_SHADER.slice(FRAGMENT_SHADER.indexOf("float lineCoverage"))}`.replace(
       "gl_FragColor",
@@ -304,7 +415,7 @@ ${FRAGMENT_SHADER.slice(FRAGMENT_SHADER.indexOf("float lineCoverage"))}`.replace
 }
 
 /** Initialize shader program and world-quad buffer. */
-function createResources(gl: ShaderGl): ShaderResources {
+function createResources(gl: ShaderGl, quad: Float32Array): ShaderResources {
   const sources = shaderSources(gl);
   const vertex = compileShader(gl, gl.VERTEX_SHADER, sources.vertex);
   let fragment: object | undefined;
@@ -324,23 +435,41 @@ function createResources(gl: ShaderGl): ShaderResources {
       );
     }
     const position = gl.getAttribLocation(program, "a_pos");
+    const other = gl.getAttribLocation(program, "a_other");
+    const side = gl.getAttribLocation(program, "a_side");
+    const globePosition = gl.getAttribLocation(program, "a_globe_pos");
+    const globeOther = gl.getAttribLocation(program, "a_globe_other");
+    const grid = gl.getAttribLocation(program, "a_grid");
     const matrix = gl.getUniformLocation(program, "u_matrix");
+    const globeMatrix = gl.getUniformLocation(program, "u_globe_matrix");
+    const transition = gl.getUniformLocation(program, "u_transition");
+    const viewport = gl.getUniformLocation(program, "u_viewport");
     const bbox = gl.getUniformLocation(program, "u_bbox");
     const steps = gl.getUniformLocation(program, "u_steps");
     const origin = gl.getUniformLocation(program, "u_origin");
-    const projected = gl.getUniformLocation(program, "u_projected");
     const edgeBorders = gl.getUniformLocation(program, "u_edge_borders");
+    const clippingPlane = gl.getUniformLocation(program, "u_globe_clipping_plane");
+    const clippingActive = gl.getUniformLocation(program, "u_globe_clipping_active");
     const color = gl.getUniformLocation(program, "u_color");
     const width = gl.getUniformLocation(program, "u_line_width");
     const opacity = gl.getUniformLocation(program, "u_opacity");
     if (
       position < 0 ||
+      other < 0 ||
+      side < 0 ||
+      globePosition < 0 ||
+      globeOther < 0 ||
+      grid < 0 ||
       !matrix ||
+      !globeMatrix ||
+      !transition ||
+      !viewport ||
       !bbox ||
       !steps ||
       !origin ||
-      !projected ||
       !edgeBorders ||
+      !clippingPlane ||
+      !clippingActive ||
       !color ||
       !width ||
       !opacity
@@ -352,17 +481,26 @@ function createResources(gl: ShaderGl): ShaderResources {
       throw new GridError("WebGL could not allocate a grid buffer");
     }
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, 0, 2, 0, -1, 1, 2, 1]), gl.STATIC_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
     return {
       program,
       buffer,
       position,
+      other,
+      side,
+      globePosition,
+      globeOther,
+      grid,
       matrix,
+      globeMatrix,
+      transition,
+      viewport,
       bbox,
       steps,
       origin,
-      projected,
       edgeBorders,
+      clippingPlane,
+      clippingActive,
       color,
       width,
       opacity,
@@ -449,6 +587,142 @@ function restoreGlState(gl: ShaderGl, state: ReturnType<typeof captureGlState>):
   }
 }
 
+/** Fold a normalized-world reference point into the view matrix using JS double precision. */
+function matrixRelativeToAnchor(
+  matrix: readonly number[],
+  anchor: readonly [number, number],
+): Float32Array {
+  if (matrix.length !== 16 || !matrix.every(Number.isFinite)) {
+    throw new GridError("map provided an invalid custom-layer matrix");
+  }
+  const relative = [...matrix];
+  relative[12] = matrix[0] * anchor[0] + matrix[4] * anchor[1] + matrix[12];
+  relative[13] = matrix[1] * anchor[0] + matrix[5] * anchor[1] + matrix[13];
+  relative[14] = matrix[2] * anchor[0] + matrix[6] * anchor[1] + matrix[14];
+  relative[15] = matrix[3] * anchor[0] + matrix[7] * anchor[1] + matrix[15];
+  return new Float32Array(relative);
+}
+
+const GLOBE_RADIUS = 8192 / (2 * Math.PI);
+const WORLD_SIZE = 40_075_016.68557849;
+
+/** Convert normalized Mercator world coordinates to Mapbox's globe ECEF coordinate space. */
+function worldToGlobe(x: number, y: number): [number, number, number] {
+  const longitude = (x - 0.5) * 360;
+  const latitude = (Math.atan(Math.sinh((0.5 - y) * 2 * Math.PI)) * 180) / Math.PI;
+  return longitudeLatitudeToGlobe(longitude, latitude);
+}
+
+function longitudeLatitudeToGlobe(longitude: number, latitude: number): [number, number, number] {
+  const longitudeRadians = (longitude * Math.PI) / 180;
+  const latitudeRadians = (latitude * Math.PI) / 180;
+  const cosLatitude = Math.cos(latitudeRadians);
+  return [
+    cosLatitude * Math.sin(longitudeRadians) * GLOBE_RADIUS,
+    -Math.sin(latitudeRadians) * GLOBE_RADIUS,
+    cosLatitude * Math.cos(longitudeRadians) * GLOBE_RADIUS,
+  ];
+}
+
+/** Multiply column-major 4x4 matrices. */
+function multiplyMatrices(left: ArrayLike<number>, right: ArrayLike<number>): number[] {
+  if (left.length !== 16 || right.length !== 16) {
+    throw new GridError("map provided an invalid projection matrix");
+  }
+  const result = new Array<number>(16).fill(0);
+  for (let column = 0; column < 4; column += 1) {
+    for (let row = 0; row < 4; row += 1) {
+      for (let inner = 0; inner < 4; inner += 1) {
+        result[column * 4 + row] += left[inner * 4 + row] * right[column * 4 + inner];
+      }
+    }
+  }
+  if (!result.every(Number.isFinite)) {
+    throw new GridError("map provided an invalid projection matrix");
+  }
+  return result;
+}
+
+/** Translate a column-major matrix by a CPU-precision reference point. */
+function matrixRelativeToPoint(
+  matrix: readonly number[],
+  anchor: readonly [number, number, number],
+): Float32Array {
+  if (matrix.length !== 16 || !matrix.every(Number.isFinite)) {
+    throw new GridError("map provided an invalid custom-layer matrix");
+  }
+  const relative = [...matrix];
+  relative[12] = matrix[0] * anchor[0] + matrix[4] * anchor[1] + matrix[8] * anchor[2] + matrix[12];
+  relative[13] = matrix[1] * anchor[0] + matrix[5] * anchor[1] + matrix[9] * anchor[2] + matrix[13];
+  relative[14] =
+    matrix[2] * anchor[0] + matrix[6] * anchor[1] + matrix[10] * anchor[2] + matrix[14];
+  relative[15] =
+    matrix[3] * anchor[0] + matrix[7] * anchor[1] + matrix[11] * anchor[2] + matrix[15];
+  return new Float32Array(relative);
+}
+
+/** Create a tessellated surface over geographic or EPSG:3857 bounds. */
+function createSurfaceMesh(
+  bounds: BBox | ProjectedBounds,
+  projected: boolean,
+  anchor: readonly [number, number],
+): { vertices: Float32Array; globeAnchor: readonly [number, number, number] } {
+  const [minX, minY, maxX, maxY] = bounds;
+  const toWorld = (x: number, y: number): [number, number] => {
+    if (projected) {
+      return [x / WORLD_SIZE + 0.5, 0.5 - y / WORLD_SIZE];
+    }
+    const latitude = Math.max(-85.0511287798066, Math.min(85.0511287798066, y));
+    return [
+      x / 360 + 0.5,
+      0.5 - Math.log(Math.tan(Math.PI / 4 + (latitude * Math.PI) / 360)) / (2 * Math.PI),
+    ];
+  };
+  const centerX = (minX + maxX) / 2;
+  const centerY = (minY + maxY) / 2;
+  const globeAnchor = projected
+    ? worldToGlobe(anchor[0], anchor[1])
+    : longitudeLatitudeToGlobe(centerX, centerY);
+  const subdivisions = 48;
+  const vertices: number[] = [];
+  const append = (x: number, y: number): void => {
+    const world = toWorld(x, y);
+    const globe = projected ? worldToGlobe(world[0], world[1]) : longitudeLatitudeToGlobe(x, y);
+    const localX = world[0] - anchor[0];
+    const localY = world[1] - anchor[1];
+    vertices.push(
+      localX,
+      localY,
+      localX,
+      localY,
+      0,
+      globe[0] - globeAnchor[0],
+      globe[1] - globeAnchor[1],
+      globe[2] - globeAnchor[2],
+      globe[0] - globeAnchor[0],
+      globe[1] - globeAnchor[1],
+      globe[2] - globeAnchor[2],
+      x - centerX,
+      y - centerY,
+    );
+  };
+  for (let row = 0; row < subdivisions; row += 1) {
+    const y0 = minY + ((maxY - minY) * row) / subdivisions;
+    const y1 = minY + ((maxY - minY) * (row + 1)) / subdivisions;
+    for (let column = 0; column < subdivisions; column += 1) {
+      const x0 = minX + ((maxX - minX) * column) / subdivisions;
+      const x1 = minX + ((maxX - minX) * (column + 1)) / subdivisions;
+      append(x0, y0);
+      append(x1, y0);
+      append(x0, y1);
+      append(x1, y0);
+      append(x1, y1);
+      append(x0, y1);
+    }
+  }
+  return { vertices: new Float32Array(vertices), globeAnchor };
+}
+
 /** Create a handle that renders a coordinate lattice through a shader. */
 function createShaderGrid(
   map: MapLike,
@@ -460,12 +734,47 @@ function createShaderGrid(
   projected: boolean,
   edgeBorders: boolean,
 ): ShaderGridHandle {
+  const worldSize = 40_075_016.68557849;
+  const centerX = (bbox[0] + bbox[2]) / 2;
+  const centerY = (bbox[1] + bbox[3]) / 2;
+  const centerLatitude =
+    (Math.max(-85.0511287798066, Math.min(85.0511287798066, centerY)) * Math.PI) / 180;
+  const anchor: [number, number] = projected
+    ? [centerX / worldSize + 0.5, 0.5 - centerY / worldSize]
+    : [
+        centerX / 360 + 0.5,
+        0.5 - Math.log(Math.tan(Math.PI / 4 + centerLatitude / 2)) / (2 * Math.PI),
+      ];
+  const localBounds: BBox = [
+    bbox[0] - centerX,
+    bbox[1] - centerY,
+    bbox[2] - centerX,
+    bbox[3] - centerY,
+  ];
+  const phase = (coordinate: number, anchorCoordinate: number, step: number): number => {
+    const value = (anchorCoordinate - coordinate) / step;
+    return value - Math.floor(value);
+  };
+  const localOrigin: [number, number] = [
+    phase(origin[0], centerX, steps[0]),
+    phase(origin[1], centerY, steps[1]),
+  ];
+  const surface = createSurfaceMesh(bbox, projected, anchor);
+  if (!surface.vertices.every(Number.isFinite)) {
+    throw new GridError("grid bounds cannot be represented in Web Mercator coordinates");
+  }
   const style: Required<ShaderGridStyleUpdate> = {
     lineColor: options.lineColor ?? "#e63946",
     lineWidth: options.lineWidth ?? 1,
     lineOpacity: options.lineOpacity ?? 0.9,
   };
   validateStyle(style);
+  const layerSettings: ShaderGridLayerUpdate = {
+    beforeId: options.beforeId,
+    minzoom: options.minzoom,
+    maxzoom: options.maxzoom,
+    slot: options.slot,
+  };
   const id = options.id ?? DEFAULT_LAYER_ID;
   let removed = false;
   let visible = true;
@@ -475,7 +784,25 @@ function createShaderGrid(
     renderer: "webgl",
     update(next): void {
       validateStyle(next);
-      Object.assign(style, next);
+      if (
+        next.beforeId !== undefined ||
+        next.minzoom !== undefined ||
+        next.maxzoom !== undefined ||
+        next.slot !== undefined
+      ) {
+        if (next.beforeId !== undefined) layerSettings.beforeId = next.beforeId;
+        if (next.minzoom !== undefined) layerSettings.minzoom = next.minzoom;
+        if (next.maxzoom !== undefined) layerSettings.maxzoom = next.maxzoom;
+        if (next.slot !== undefined) layerSettings.slot = next.slot;
+        whenStyleReady(map, () => {
+          if (!removed && map.getLayer(id)) {
+            updateLayerSettings(map, id, next, () => {});
+          }
+        });
+      }
+      if (next.lineColor !== undefined) style.lineColor = next.lineColor;
+      if (next.lineWidth !== undefined) style.lineWidth = next.lineWidth;
+      if (next.lineOpacity !== undefined) style.lineOpacity = next.lineOpacity;
       map.triggerRepaint?.();
     },
     show(): void {
@@ -515,7 +842,7 @@ function createShaderGrid(
   const initialize = (context: ShaderGl): void => {
     releaseResources();
     gl = context;
-    resources = createResources(context);
+    resources = createResources(context, surface.vertices);
   };
   const handleContextRestored = (): void => {
     if (gl && !removed) {
@@ -530,32 +857,107 @@ function createShaderGrid(
     id,
     type: "custom",
     renderingMode: "2d",
-    minzoom: options.minzoom,
-    maxzoom: options.maxzoom,
     slot: options.slot,
     onAdd(_map: unknown, context: ShaderGl): void {
       initialize(context);
     },
-    render(context: ShaderGl, matrix: number[]): void {
-      if (removed || !visible || !resources) {
+    render(
+      context: ShaderGl,
+      matrix: number[],
+      projection?: ShaderProjection,
+      projectionToMercatorMatrix?: number[],
+      projectionToMercatorTransition?: number,
+      _centerInMercator?: number[],
+      _pixelsPerMeterRatio?: number,
+      renderParameters?: ShaderRenderParameters,
+    ): void {
+      const zoom = map.getZoom?.();
+      if (
+        removed ||
+        !visible ||
+        !resources ||
+        (zoom !== undefined &&
+          ((layerSettings.minzoom !== undefined && zoom < layerSettings.minzoom) ||
+            (layerSettings.maxzoom !== undefined && zoom >= layerSettings.maxzoom)))
+      ) {
         return;
       }
-      const state = captureGlState(context, [resources.position]);
+      const viewport = context.getParameter(context.VIEWPORT) as ArrayLike<number> | null;
+      if (!viewport || viewport.length < 4 || viewport[2] <= 0 || viewport[3] <= 0) {
+        throw new GridError("WebGL returned an invalid viewport for the shader grid");
+      }
+      const isGlobe = projection?.name === "globe";
+      if (
+        isGlobe &&
+        (!projectionToMercatorMatrix || projectionToMercatorTransition === undefined)
+      ) {
+        throw new GridError("globe shader rendering requires Mapbox's globe projection matrices");
+      }
+      const mercatorMatrix = matrixRelativeToAnchor(matrix, anchor);
+      const globeMatrix =
+        isGlobe && projectionToMercatorMatrix
+          ? matrixRelativeToPoint(
+              multiplyMatrices(matrix, projectionToMercatorMatrix),
+              surface.globeAnchor,
+            )
+          : mercatorMatrix;
+      const transition = isGlobe ? (projectionToMercatorTransition ?? 0) : 1;
+      const clippingPlane = isGlobe ? renderParameters?.globeClippingPlane : undefined;
+      const localClippingPlane: [number, number, number, number] = clippingPlane
+        ? [
+            clippingPlane[0],
+            clippingPlane[1],
+            clippingPlane[2],
+            clippingPlane[3] +
+              clippingPlane[0] * surface.globeAnchor[0] +
+              clippingPlane[1] * surface.globeAnchor[1] +
+              clippingPlane[2] * surface.globeAnchor[2],
+          ]
+        : [0, 0, 1, 0];
+      const attributes = [
+        resources.position,
+        resources.other,
+        resources.side,
+        resources.globePosition,
+        resources.globeOther,
+        resources.grid,
+      ];
+      const state = captureGlState(context, attributes);
       try {
         context.useProgram(resources.program);
         context.bindBuffer(context.ARRAY_BUFFER, resources.buffer);
         context.enableVertexAttribArray(resources.position);
-        context.vertexAttribPointer(resources.position, 2, context.FLOAT, false, 0, 0);
-        context.uniformMatrix4fv(resources.matrix, false, new Float32Array(matrix));
-        context.uniform4f(resources.bbox, bbox[0], bbox[1], bbox[2], bbox[3]);
+        context.vertexAttribPointer(resources.position, 2, context.FLOAT, false, 52, 0);
+        context.enableVertexAttribArray(resources.other);
+        context.vertexAttribPointer(resources.other, 2, context.FLOAT, false, 52, 8);
+        context.enableVertexAttribArray(resources.side);
+        context.vertexAttribPointer(resources.side, 1, context.FLOAT, false, 52, 16);
+        context.enableVertexAttribArray(resources.globePosition);
+        context.vertexAttribPointer(resources.globePosition, 3, context.FLOAT, false, 52, 20);
+        context.enableVertexAttribArray(resources.globeOther);
+        context.vertexAttribPointer(resources.globeOther, 3, context.FLOAT, false, 52, 32);
+        context.enableVertexAttribArray(resources.grid);
+        context.vertexAttribPointer(resources.grid, 2, context.FLOAT, false, 52, 44);
+        context.uniformMatrix4fv(resources.matrix, false, mercatorMatrix);
+        context.uniformMatrix4fv(resources.globeMatrix, false, globeMatrix);
+        context.uniform1f(resources.transition, transition);
+        context.uniform2f(resources.viewport, viewport[2], viewport[3]);
+        context.uniform4f(
+          resources.bbox,
+          localBounds[0],
+          localBounds[1],
+          localBounds[2],
+          localBounds[3],
+        );
         context.uniform2f(resources.steps, steps[0], steps[1]);
-        context.uniform2f(resources.origin, origin[0], origin[1]);
-        context.uniform1i(resources.projected, projected ? 1 : 0);
+        context.uniform2f(resources.origin, localOrigin[0], localOrigin[1]);
         context.uniform1i(resources.edgeBorders, edgeBorders ? 1 : 0);
         const color = parseHexColor(style.lineColor);
         context.uniform4f(resources.color, color[0], color[1], color[2], color[3]);
         context.uniform1f(resources.width, style.lineWidth * (map.getPixelRatio?.() ?? 1));
         context.uniform1f(resources.opacity, style.lineOpacity);
+        context.uniform4f(resources.clippingPlane, ...localClippingPlane);
+        context.uniform1f(resources.clippingActive, clippingPlane ? 1 : 0);
         context.disable(context.DEPTH_TEST);
         context.depthMask(false);
         context.enable(context.BLEND);
@@ -566,7 +968,7 @@ function createShaderGrid(
           context.ONE,
           context.ONE_MINUS_SRC_ALPHA,
         );
-        context.drawArrays(context.TRIANGLE_STRIP, 0, 4);
+        context.drawArrays(context.TRIANGLES, 0, surface.vertices.length / 13);
       } finally {
         restoreGlState(context, state);
       }
@@ -603,35 +1005,68 @@ function createShaderGrid(
 
 /** Create a GeoJSON fallback handle with shader-style paint values. */
 function createGeoJsonFallback(
+  map: MapLike,
+  id: string,
   handle: {
     update(options: { paint: Record<string, unknown> }): void;
     show(): void;
     hide(): void;
     remove(): void;
   },
+  fallbackReason: string,
   initial: ShaderGridStyleUpdate,
+  initialLayerSettings: ShaderGridLayerUpdate,
 ): ShaderGridHandle {
+  console.warn(`[mapbox-bbox-grid] Using the GeoJSON renderer: ${fallbackReason}`);
   const style = {
     lineColor: initial.lineColor ?? "#e63946",
     lineWidth: initial.lineWidth ?? 1,
     lineOpacity: initial.lineOpacity ?? 0.9,
   };
+  const layerSettings = { ...initialLayerSettings };
   return {
     renderer: "geojson",
     update(next): void {
       validateStyle(next);
-      Object.assign(style, next);
       const paint: Record<string, unknown> = {};
       if (next.lineColor !== undefined) {
-        paint["line-color"] = style.lineColor;
+        style.lineColor = next.lineColor;
+        paint["line-color"] = next.lineColor;
       }
       if (next.lineWidth !== undefined) {
-        paint["line-width"] = style.lineWidth;
+        style.lineWidth = next.lineWidth;
+        paint["line-width"] = next.lineWidth;
       }
       if (next.lineOpacity !== undefined) {
-        paint["line-opacity"] = style.lineOpacity;
+        style.lineOpacity = next.lineOpacity;
+        paint["line-opacity"] = next.lineOpacity;
       }
-      handle.update({ paint });
+      if (Object.keys(paint).length > 0) {
+        handle.update({ paint });
+      }
+      if (
+        next.beforeId !== undefined ||
+        next.minzoom !== undefined ||
+        next.maxzoom !== undefined ||
+        next.slot !== undefined
+      ) {
+        const mergedSettings = { ...layerSettings, ...next };
+        if (next.beforeId !== undefined) layerSettings.beforeId = next.beforeId;
+        if (next.minzoom !== undefined) layerSettings.minzoom = next.minzoom;
+        if (next.maxzoom !== undefined) layerSettings.maxzoom = next.maxzoom;
+        if (next.slot !== undefined) layerSettings.slot = next.slot;
+        whenStyleReady(map, () => {
+          if (!map.getLayer(id)) {
+            return;
+          }
+          updateLayerSettings(map, id, next, () => {
+            if (!map.setLayerZoomRange) {
+              throw new GridError("map does not support updating layer zoom ranges");
+            }
+            map.setLayerZoomRange(id, mergedSettings.minzoom, mergedSettings.maxzoom);
+          });
+        });
+      }
     },
     show: () => handle.show(),
     hide: () => handle.hide(),
@@ -643,32 +1078,60 @@ const PROJECTED_LINE_VERTEX_SHADER = `
 attribute vec2 a_pos;
 attribute vec2 a_other;
 attribute float a_side;
+attribute vec3 a_globe_pos;
+attribute vec3 a_globe_other;
 uniform mat4 u_matrix;
+uniform mat4 u_globe_matrix;
 uniform vec2 u_viewport;
 uniform float u_line_width;
+uniform float u_transition;
+varying vec3 v_globe;
 void main() {
-  vec4 position = u_matrix * vec4(a_pos, 0.0, 1.0);
-  vec4 other = u_matrix * vec4(a_other, 0.0, 1.0);
+  vec4 position = mix(
+    u_globe_matrix * vec4(a_globe_pos, 1.0),
+    u_matrix * vec4(a_pos, 0.0, 1.0),
+    u_transition
+  );
+  vec4 other = mix(
+    u_globe_matrix * vec4(a_globe_other, 1.0),
+    u_matrix * vec4(a_other, 0.0, 1.0),
+    u_transition
+  );
   vec2 direction = (other.xy / max(other.w, 0.000001) - position.xy / max(position.w, 0.000001)) * u_viewport;
   float magnitude = max(length(direction), 0.000001);
   vec2 normal = vec2(-direction.y, direction.x) / magnitude;
   position.xy += normal * a_side * u_line_width / u_viewport * position.w;
   gl_Position = position;
+  v_globe = a_globe_pos;
 }`;
 
 const PROJECTED_LINE_FRAGMENT_SHADER = `
-precision mediump float;
+precision highp float;
 uniform vec4 u_color;
 uniform float u_opacity;
+uniform vec4 u_globe_clipping_plane;
+uniform float u_globe_clipping_active;
+uniform float u_transition;
+varying vec3 v_globe;
 void main() {
-  gl_FragColor = vec4(u_color.rgb, u_color.a * u_opacity);
+  float alpha = u_color.a * u_opacity;
+  if (u_globe_clipping_active > 0.5 && u_transition < 1.0) {
+    float signedDistance = dot(u_globe_clipping_plane.xyz, v_globe)
+      + u_globe_clipping_plane.w;
+    alpha *= mix(step(0.0, signedDistance), 1.0, u_transition);
+  }
+  gl_FragColor = vec4(u_color.rgb, alpha);
 }`;
 
 /** Convert WGS84 line features to triangle ribbons in normalized Web Mercator coordinates. */
 function projectedGridVertices(
   bounds: ProjectedBounds,
   options: ShaderProjectedGridOptions,
-): Float32Array {
+): {
+  vertices: Float32Array;
+  anchor: readonly [number, number];
+  globeAnchor: readonly [number, number, number];
+} {
   const grid = createProjectedGridFromBounds(bounds, {
     crs: options.crs,
     resolution: options.resolution,
@@ -676,18 +1139,14 @@ function projectedGridVertices(
     maxLines: options.maxLines,
     maxSegmentLength: options.maxSegmentLength,
   });
-  const vertices: number[] = [];
+  const segments: {
+    start: [number, number];
+    end: [number, number];
+  }[] = [];
   const maxLatitude = 85.0511287798066;
   const toWorld = (longitude: number, latitude: number): [number, number] => {
     const lat = (Math.max(-maxLatitude, Math.min(maxLatitude, latitude)) * Math.PI) / 180;
     return [longitude / 360 + 0.5, 0.5 - Math.log(Math.tan(Math.PI / 4 + lat / 2)) / (2 * Math.PI)];
-  };
-  const appendVertex = (
-    position: readonly [number, number],
-    other: readonly [number, number],
-    side: number,
-  ): void => {
-    vertices.push(position[0], position[1], other[0], other[1], side);
   };
   for (const feature of grid.features) {
     if (feature.geometry.type !== "MultiLineString") {
@@ -700,16 +1159,55 @@ function projectedGridVertices(
         if (![...start, ...end].every(Number.isFinite)) {
           throw new GridError("grid cannot be represented in Web Mercator coordinates");
         }
-        appendVertex(start, end, -1);
-        appendVertex(start, end, 1);
-        appendVertex(end, start, 1);
-        appendVertex(start, end, 1);
-        appendVertex(end, start, -1);
-        appendVertex(end, start, 1);
+        segments.push({ start, end });
       }
     }
   }
-  return new Float32Array(vertices);
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  for (const { start, end } of segments) {
+    minX = Math.min(minX, start[0], end[0]);
+    minY = Math.min(minY, start[1], end[1]);
+    maxX = Math.max(maxX, start[0], end[0]);
+    maxY = Math.max(maxY, start[1], end[1]);
+  }
+  const anchor: [number, number] = segments.length
+    ? [(minX + maxX) / 2, (minY + maxY) / 2]
+    : [0.5, 0.5];
+  const globeAnchor = worldToGlobe(anchor[0], anchor[1]);
+  const vertices: number[] = [];
+  const appendVertex = (
+    position: readonly [number, number],
+    other: readonly [number, number],
+    side: number,
+  ): void => {
+    const globePosition = worldToGlobe(position[0], position[1]);
+    const globeOther = worldToGlobe(other[0], other[1]);
+    vertices.push(
+      position[0] - anchor[0],
+      position[1] - anchor[1],
+      other[0] - anchor[0],
+      other[1] - anchor[1],
+      side,
+      globePosition[0] - globeAnchor[0],
+      globePosition[1] - globeAnchor[1],
+      globePosition[2] - globeAnchor[2],
+      globeOther[0] - globeAnchor[0],
+      globeOther[1] - globeAnchor[1],
+      globeOther[2] - globeAnchor[2],
+    );
+  };
+  for (const { start, end } of segments) {
+    appendVertex(start, end, -1);
+    appendVertex(start, end, 1);
+    appendVertex(end, start, 1);
+    appendVertex(start, end, 1);
+    appendVertex(end, start, -1);
+    appendVertex(end, start, 1);
+  }
+  return { vertices: new Float32Array(vertices), anchor, globeAnchor };
 }
 
 interface ProjectedShaderResources {
@@ -718,8 +1216,14 @@ interface ProjectedShaderResources {
   position: number;
   other: number;
   side: number;
+  globePosition: number;
+  globeOther: number;
   matrix: object;
+  globeMatrix: object;
+  transition: object;
   viewport: object;
+  clippingPlane: object;
+  clippingActive: object;
   color: object;
   width: object;
   opacity: object;
@@ -736,27 +1240,51 @@ function createProjectedShaderResources(
 in vec2 a_pos;
 in vec2 a_other;
 in float a_side;
+in vec3 a_globe_pos;
+in vec3 a_globe_other;
 uniform mat4 u_matrix;
+uniform mat4 u_globe_matrix;
 uniform vec2 u_viewport;
 uniform float u_line_width;
+uniform float u_transition;
+out vec3 v_globe;
 void main() {
-  vec4 position = u_matrix * vec4(a_pos, 0.0, 1.0);
-  vec4 other = u_matrix * vec4(a_other, 0.0, 1.0);
+  vec4 position = mix(
+    u_globe_matrix * vec4(a_globe_pos, 1.0),
+    u_matrix * vec4(a_pos, 0.0, 1.0),
+    u_transition
+  );
+  vec4 other = mix(
+    u_globe_matrix * vec4(a_globe_other, 1.0),
+    u_matrix * vec4(a_other, 0.0, 1.0),
+    u_transition
+  );
   vec2 direction = (other.xy / max(other.w, 0.000001) - position.xy / max(position.w, 0.000001)) * u_viewport;
   float magnitude = max(length(direction), 0.000001);
   vec2 normal = vec2(-direction.y, direction.x) / magnitude;
   position.xy += normal * a_side * u_line_width / u_viewport * position.w;
   gl_Position = position;
+  v_globe = a_globe_pos;
 }`
     : PROJECTED_LINE_VERTEX_SHADER;
   const fragmentSource = isWebGL2
     ? `#version 300 es
-precision mediump float;
+precision highp float;
 uniform vec4 u_color;
 uniform float u_opacity;
+uniform vec4 u_globe_clipping_plane;
+uniform float u_globe_clipping_active;
+uniform float u_transition;
+in vec3 v_globe;
 out vec4 fragColor;
 void main() {
-  fragColor = vec4(u_color.rgb, u_color.a * u_opacity);
+  float alpha = u_color.a * u_opacity;
+  if (u_globe_clipping_active > 0.5 && u_transition < 1.0) {
+    float signedDistance = dot(u_globe_clipping_plane.xyz, v_globe)
+      + u_globe_clipping_plane.w;
+    alpha *= mix(step(0.0, signedDistance), 1.0, u_transition);
+  }
+  fragColor = vec4(u_color.rgb, alpha);
 }`
     : PROJECTED_LINE_FRAGMENT_SHADER;
   const vertex = compileShader(gl, gl.VERTEX_SHADER, vertexSource);
@@ -779,8 +1307,14 @@ void main() {
     const position = gl.getAttribLocation(program, "a_pos");
     const other = gl.getAttribLocation(program, "a_other");
     const side = gl.getAttribLocation(program, "a_side");
+    const globePosition = gl.getAttribLocation(program, "a_globe_pos");
+    const globeOther = gl.getAttribLocation(program, "a_globe_other");
     const matrix = gl.getUniformLocation(program, "u_matrix");
+    const globeMatrix = gl.getUniformLocation(program, "u_globe_matrix");
+    const transition = gl.getUniformLocation(program, "u_transition");
     const viewport = gl.getUniformLocation(program, "u_viewport");
+    const clippingPlane = gl.getUniformLocation(program, "u_globe_clipping_plane");
+    const clippingActive = gl.getUniformLocation(program, "u_globe_clipping_active");
     const color = gl.getUniformLocation(program, "u_color");
     const width = gl.getUniformLocation(program, "u_line_width");
     const opacity = gl.getUniformLocation(program, "u_opacity");
@@ -788,8 +1322,14 @@ void main() {
       position < 0 ||
       other < 0 ||
       side < 0 ||
+      globePosition < 0 ||
+      globeOther < 0 ||
       !matrix ||
+      !globeMatrix ||
+      !transition ||
       !viewport ||
+      !clippingPlane ||
+      !clippingActive ||
       !color ||
       !width ||
       !opacity
@@ -802,7 +1342,24 @@ void main() {
     }
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
     gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
-    return { program, buffer, position, other, side, matrix, viewport, color, width, opacity };
+    return {
+      program,
+      buffer,
+      position,
+      other,
+      side,
+      globePosition,
+      globeOther,
+      matrix,
+      globeMatrix,
+      transition,
+      viewport,
+      clippingPlane,
+      clippingActive,
+      color,
+      width,
+      opacity,
+    };
   } catch (error) {
     if (program) {
       gl.deleteProgram(program);
@@ -821,6 +1378,8 @@ function createProjectedGeometryGrid(
   map: MapLike,
   options: ShaderProjectedGridOptions,
   vertices: Float32Array,
+  anchor: readonly [number, number],
+  globeAnchor: readonly [number, number, number],
 ): ShaderGridHandle {
   const style: Required<ShaderGridStyleUpdate> = {
     lineColor: options.lineColor ?? "#e63946",
@@ -828,6 +1387,12 @@ function createProjectedGeometryGrid(
     lineOpacity: options.lineOpacity ?? 0.9,
   };
   validateStyle(style);
+  const layerSettings: ShaderGridLayerUpdate = {
+    beforeId: options.beforeId,
+    minzoom: options.minzoom,
+    maxzoom: options.maxzoom,
+    slot: options.slot,
+  };
   const id = options.id ?? DEFAULT_LAYER_ID;
   let removed = false;
   let visible = true;
@@ -858,7 +1423,21 @@ function createProjectedGeometryGrid(
     renderer: "webgl",
     update(next): void {
       validateStyle(next);
-      Object.assign(style, next);
+      if (
+        next.beforeId !== undefined ||
+        next.minzoom !== undefined ||
+        next.maxzoom !== undefined ||
+        next.slot !== undefined
+      ) {
+        updateLayerSettings(map, id, next, (minzoom, maxzoom) => {
+          layerSettings.minzoom = minzoom;
+          layerSettings.maxzoom = maxzoom;
+        });
+        Object.assign(layerSettings, next);
+      }
+      if (next.lineColor !== undefined) style.lineColor = next.lineColor;
+      if (next.lineWidth !== undefined) style.lineWidth = next.lineWidth;
+      if (next.lineOpacity !== undefined) style.lineOpacity = next.lineOpacity;
       map.triggerRepaint?.();
     },
     show(): void {
@@ -890,32 +1469,87 @@ function createProjectedGeometryGrid(
     id,
     type: "custom",
     renderingMode: "2d",
-    minzoom: options.minzoom,
-    maxzoom: options.maxzoom,
     slot: options.slot,
     onAdd(_map: unknown, context: ShaderGl): void {
       initialize(context);
     },
-    render(context: ShaderGl, matrix: number[]): void {
-      if (removed || !visible || !resources || vertices.length === 0) {
+    render(
+      context: ShaderGl,
+      matrix: number[],
+      projection?: ShaderProjection,
+      projectionToMercatorMatrix?: number[],
+      projectionToMercatorTransition?: number,
+      _centerInMercator?: number[],
+      _pixelsPerMeterRatio?: number,
+      renderParameters?: ShaderRenderParameters,
+    ): void {
+      const zoom = map.getZoom?.();
+      if (
+        removed ||
+        !visible ||
+        !resources ||
+        vertices.length === 0 ||
+        (zoom !== undefined &&
+          ((layerSettings.minzoom !== undefined && zoom < layerSettings.minzoom) ||
+            (layerSettings.maxzoom !== undefined && zoom >= layerSettings.maxzoom)))
+      ) {
         return;
       }
       const viewport = context.getParameter(context.VIEWPORT) as ArrayLike<number> | null;
       if (!viewport || viewport.length < 4 || viewport[2] <= 0 || viewport[3] <= 0) {
         throw new GridError("WebGL returned an invalid viewport for the projected grid");
       }
-      const state = captureGlState(context, [resources.position, resources.other, resources.side]);
+      const isGlobe = projection?.name === "globe";
+      if (
+        isGlobe &&
+        (!projectionToMercatorMatrix || projectionToMercatorTransition === undefined)
+      ) {
+        throw new GridError("globe shader rendering requires Mapbox's globe projection matrices");
+      }
+      const mercatorMatrix = matrixRelativeToAnchor(matrix, anchor);
+      const globeMatrix =
+        isGlobe && projectionToMercatorMatrix
+          ? matrixRelativeToPoint(multiplyMatrices(matrix, projectionToMercatorMatrix), globeAnchor)
+          : mercatorMatrix;
+      const transition = isGlobe ? (projectionToMercatorTransition ?? 0) : 1;
+      const clippingPlane = isGlobe ? renderParameters?.globeClippingPlane : undefined;
+      const localClippingPlane: [number, number, number, number] = clippingPlane
+        ? [
+            clippingPlane[0],
+            clippingPlane[1],
+            clippingPlane[2],
+            clippingPlane[3] +
+              clippingPlane[0] * globeAnchor[0] +
+              clippingPlane[1] * globeAnchor[1] +
+              clippingPlane[2] * globeAnchor[2],
+          ]
+        : [0, 0, 1, 0];
+      const state = captureGlState(context, [
+        resources.position,
+        resources.other,
+        resources.side,
+        resources.globePosition,
+        resources.globeOther,
+      ]);
       try {
         context.useProgram(resources.program);
         context.bindBuffer(context.ARRAY_BUFFER, resources.buffer);
         context.enableVertexAttribArray(resources.position);
-        context.vertexAttribPointer(resources.position, 2, context.FLOAT, false, 20, 0);
+        context.vertexAttribPointer(resources.position, 2, context.FLOAT, false, 44, 0);
         context.enableVertexAttribArray(resources.other);
-        context.vertexAttribPointer(resources.other, 2, context.FLOAT, false, 20, 8);
+        context.vertexAttribPointer(resources.other, 2, context.FLOAT, false, 44, 8);
         context.enableVertexAttribArray(resources.side);
-        context.vertexAttribPointer(resources.side, 1, context.FLOAT, false, 20, 16);
-        context.uniformMatrix4fv(resources.matrix, false, new Float32Array(matrix));
+        context.vertexAttribPointer(resources.side, 1, context.FLOAT, false, 44, 16);
+        context.enableVertexAttribArray(resources.globePosition);
+        context.vertexAttribPointer(resources.globePosition, 3, context.FLOAT, false, 44, 20);
+        context.enableVertexAttribArray(resources.globeOther);
+        context.vertexAttribPointer(resources.globeOther, 3, context.FLOAT, false, 44, 32);
+        context.uniformMatrix4fv(resources.matrix, false, mercatorMatrix);
+        context.uniformMatrix4fv(resources.globeMatrix, false, globeMatrix);
+        context.uniform1f(resources.transition, transition);
         context.uniform2f(resources.viewport, viewport[2], viewport[3]);
+        context.uniform4f(resources.clippingPlane, ...localClippingPlane);
+        context.uniform1f(resources.clippingActive, clippingPlane ? 1 : 0);
         const color = parseHexColor(style.lineColor);
         context.uniform4f(resources.color, color[0], color[1], color[2], color[3]);
         context.uniform1f(resources.width, style.lineWidth * (map.getPixelRatio?.() ?? 1));
@@ -972,24 +1606,40 @@ export function addShaderBBoxGrid(map: MapLike, options: ShaderGridOptions): Sha
           maxCells: Number.POSITIVE_INFINITY,
         };
   const grid = new BBoxGrid(options.bbox, shapeOptions);
-  if (map.getProjection?.().name !== "mercator") {
+  const projection = map.getProjection?.().name;
+  const supportsShader = projection === "mercator" || projection === "globe";
+  if (!supportsShader) {
     if (options.fallback === "error") {
-      throw new GridError("WebGL grid shaders require the Mercator map projection");
+      throw new GridError("WebGL grid shaders require a Mercator or globe map projection");
     }
     const { lineColor, lineWidth, lineOpacity, fallback: _fallback, ...geojsonOptions } = options;
-    const fallbackOptions =
+    const paint = {
+      "line-color": lineColor ?? "#e63946",
+      "line-width": lineWidth ?? 1,
+      "line-opacity": lineOpacity ?? 0.9,
+    };
+    const handle =
       geojsonOptions.cells !== undefined
-        ? { ...geojsonOptions, cells: geojsonOptions.cells }
-        : { ...geojsonOptions, resolution: geojsonOptions.resolution };
-    const handle = addBBoxGrid(map, {
-      ...fallbackOptions,
-      paint: {
-        "line-color": lineColor ?? "#e63946",
-        "line-width": lineWidth ?? 1,
-        "line-opacity": lineOpacity ?? 0.9,
-      },
-    });
-    return createGeoJsonFallback(handle, { lineColor, lineWidth, lineOpacity });
+        ? addBBoxGrid(map, {
+            ...geojsonOptions,
+            cells: geojsonOptions.cells,
+            viewport: false,
+            paint,
+          })
+        : addBBoxGrid(map, {
+            ...geojsonOptions,
+            resolution: geojsonOptions.resolution,
+            viewport: geojsonOptions.viewport ?? true,
+            paint,
+          });
+    return createGeoJsonFallback(
+      map,
+      options.id ?? DEFAULT_LAYER_ID,
+      handle,
+      `custom shader layers do not support the "${projection ?? "unknown"}" projection`,
+      { lineColor, lineWidth, lineOpacity },
+      options,
+    );
   }
   return createShaderGrid(
     map,
@@ -1002,7 +1652,11 @@ export function addShaderBBoxGrid(map: MapLike, options: ShaderGridOptions): Sha
   );
 }
 
-/** Draw an EPSG:3857 grid in a fragment shader, falling back for other CRSs/projections. */
+/**
+ * Draw a projected-CRS grid with WebGL on Mercator and globe maps.
+ * EPSG:3857 uses a fragment shader; other CRSs use Proj4-generated line meshes.
+ * Unsupported map projections use the viewport-aware GeoJSON fallback unless `fallback: "error"` is set.
+ */
 export function addShaderProjectedGrid(
   map: MapLike,
   bounds: ProjectedBounds,
@@ -1025,14 +1679,15 @@ export function addShaderProjectedGrid(
     throw new GridError("resolution must be positive and finite");
   }
   const halfWorld = 20_037_508.342789244;
-  const isMercatorMap = map.getProjection?.().name === "mercator";
+  const projection = map.getProjection?.().name;
+  const supportsShader = projection === "mercator" || projection === "globe";
   const canShader =
     options.crs === "EPSG:3857" &&
     minX >= -halfWorld &&
     maxX <= halfWorld &&
     minY >= -halfWorld &&
     maxY <= halfWorld &&
-    isMercatorMap &&
+    supportsShader &&
     options.maxLines === undefined;
   if (
     options.origin !== undefined &&
@@ -1042,23 +1697,32 @@ export function addShaderProjectedGrid(
   ) {
     throw new GridError("origin must contain two finite coordinates");
   }
-  if (!isMercatorMap) {
+  if (!supportsShader) {
     if (options.fallback === "error") {
-      throw new GridError("WebGL projected grids require a Mercator map projection");
+      throw new GridError("WebGL projected grids require a Mercator or globe map projection");
     }
     const { lineColor, lineWidth, lineOpacity, fallback: _fallback, ...projectedOptions } = options;
     const handle: ProjectedGridOverlayHandle = addProjectedGrid(map, bounds, {
       ...projectedOptions,
+      viewport: projectedOptions.viewport ?? true,
       paint: {
         "line-color": lineColor ?? "#e63946",
         "line-width": lineWidth ?? 1,
         "line-opacity": lineOpacity ?? 0.9,
       },
     });
-    return createGeoJsonFallback(handle, { lineColor, lineWidth, lineOpacity });
+    return createGeoJsonFallback(
+      map,
+      options.id ?? DEFAULT_LAYER_ID,
+      handle,
+      `custom shader layers do not support the "${projection ?? "unknown"}" projection`,
+      { lineColor, lineWidth, lineOpacity },
+      options,
+    );
   }
   if (!canShader) {
-    return createProjectedGeometryGrid(map, options, projectedGridVertices(bounds, options));
+    const mesh = projectedGridVertices(bounds, options);
+    return createProjectedGeometryGrid(map, options, mesh.vertices, mesh.anchor, mesh.globeAnchor);
   }
   const { lineColor, lineWidth, lineOpacity, fallback: _fallback, ...layerOptions } = options;
   return createShaderGrid(
@@ -1070,4 +1734,28 @@ export function addShaderProjectedGrid(
     true,
     false,
   );
+}
+
+/** Draw a Web Mercator tile-pixel lattice with spacing derived from zoom and tile size. */
+export function addShaderTilePixelGrid(
+  map: MapLike,
+  bounds: ProjectedBounds,
+  options: ShaderTilePixelGridOptions,
+): ShaderGridHandle {
+  const { zoom, tileSize = 256, ...layerOptions } = options;
+  if (!Number.isInteger(zoom) || zoom < 0 || !Number.isInteger(tileSize) || tileSize <= 0) {
+    throw new GridError("zoom must be a non-negative integer and tileSize a positive integer");
+  }
+  const worldSize = 40_075_016.685_578_49;
+  const halfWorld = worldSize / 2;
+  const resolution = worldSize / (tileSize * 2 ** zoom);
+  if (!Number.isFinite(resolution) || resolution <= 0) {
+    throw new GridError("tile zoom and size produce an invalid pixel resolution");
+  }
+  return addShaderProjectedGrid(map, bounds, {
+    ...layerOptions,
+    crs: "EPSG:3857",
+    origin: [-halfWorld, -halfWorld],
+    resolution,
+  });
 }
