@@ -172,6 +172,50 @@ tileProtocol.remove();
 The MapLibre protocol handler generates tile data in the application thread. For lower-spec
 devices, prefer generating tiles on a server and let the map cache the requested tiles.
 
+## WebGL shader grids
+
+For regular grids that need no per-line feature properties, use a custom WebGL layer to calculate
+line coverage in the fragment shader instead of creating GeoJSON or tile geometry:
+
+```ts
+import { addShaderBBoxGrid, addShaderProjectedGrid } from "@jack_rogers/mapbox-bbox-grid";
+
+const shaderGrid = addShaderBBoxGrid(map, {
+  bbox: [-2.7, 51.4, -2.5, 51.5],
+  resolution: 0.001,
+  lineColor: "#0077ff",
+  lineWidth: 1,
+  lineOpacity: 0.9,
+});
+shaderGrid.hide();
+shaderGrid.show();
+shaderGrid.update({ lineWidth: 2 });
+shaderGrid.remove();
+
+// EPSG:3857 uses a geometry-free fragment shader; other projected CRSs
+// use Proj4 to prepare a WebGL line mesh:
+const projectedShaderGrid = addShaderProjectedGrid(
+  map,
+  [400_000, 100_000, 500_000, 200_000],
+  { crs: "EPSG:32631", resolution: 10_000, maxLines: 1000 },
+);
+```
+
+Shader grids use a Mapbox/MapLibre custom layer and require the map's Mercator projection. The
+geographic API supports the same geographic degree/metric grid spacing as `addBBoxGrid`. Projected
+grids use the supplied Proj4 CRS and native linear units. EPSG:3857 uses the geometry-free
+fragment-shader lattice. Other projected CRSs are transformed with Proj4 and rendered as screen-space
+WebGL line meshes, avoiding Mapbox GeoJSON source tiling while retaining CRS-aligned line positions.
+This path prepares mesh geometry on the CPU, so its work and memory grow with line count; set
+`maxLines` to reject grids that would exceed a chosen line count. Supplying `maxLines` selects this
+bounded mesh path even for EPSG:3857. For non-Mercator map projections, the default `fallback: "geojson"`
+uses the existing GeoJSON renderer. Set `fallback: "error"` to reject unsupported map projections.
+
+Shader styling is intentionally limited to solid `#rgb` or `#rrggbb` colors, positive line widths,
+and opacity from 0 to 1. It does not support Mapbox paint expressions, per-line feature properties,
+or cell fills. Use `addBBoxGrid`/`addProjectedGrid` or vector tiles when those features are needed.
+Shader grids still use GPU work across the map viewport; benchmark dense grids on target devices.
+
 ## Options
 
 | Option                                     | Meaning                                                                                                                                                     |
@@ -234,6 +278,7 @@ const grid = addProjectedGrid(map, chartBounds, {
 - `addProjectedGrid` accepts `viewport: true` or `{ padding, maxLines }` to generate visible lines only. It refreshes on `moveend`, skips unchanged snapped views, and thins by whole multiples of the resolution, so lines remain on the original CRS grid. Its optional top-level `maxLines` limits full-grid output; viewport mode uses its own `viewport.maxLines` as a thinning target instead of failing.
 - `createBBoxGridTileGenerator` and `createProjectedGridTileGenerator` generate MVT data on demand per XYZ request, with a default cap of 1000 lines per tile. Serve those bytes from an HTTP tile endpoint for Mapbox GL JS; its vector source cache handles repeat tile requests. Tile generation itself still costs CPU on a cache miss, so coarser grids or a server-side cache may be appropriate for very dense grids.
 - Grid transforms are cached for viewport refreshes. EPSG:3857 lines use two vertices by default; other projected grids densify curved lines for display. `addTilePixelGrid` derives the EPSG:3857 origin and pixel spacing from zoom and tile size.
+- Projected shader grids outside EPSG:3857 use Proj4 to build a WebGL mesh. Set `maxLines` when the CRS bounds or resolution could produce a dense grid.
 - The optional worker moves projected GeoJSON generation off the main thread; it does not change Mapbox's GeoJSON source tiling or line-rendering cost. Shader rendering and on-demand vector-tile sources are not provided.
 - Default line width and opacity fade with zoom so far-out views stay light.
 

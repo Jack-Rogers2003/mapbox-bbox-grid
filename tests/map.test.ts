@@ -11,6 +11,8 @@ import type {
 import {
   addBBoxGrid,
   addProjectedGrid,
+  addShaderBBoxGrid,
+  addShaderProjectedGrid,
   addTilePixelGrid,
   addVectorGridTileLayer,
   createBBoxGridTileGenerator,
@@ -34,11 +36,17 @@ interface FakeSource {
  * @param options - Initial style-loaded flag and visible bounds.
  */
 function createFakeMap(
-  options: { styleLoaded?: boolean; bounds?: BBox; pixelsPerDegree?: number } = {},
+  options: {
+    styleLoaded?: boolean;
+    bounds?: BBox;
+    pixelsPerDegree?: number;
+    projection?: string;
+  } = {},
 ) {
   const sources = new Map<string, FakeSource>();
   const layers = new Map<string, Record<string, unknown>>();
   const moveEndListeners = new Set<() => void>();
+  const contextRestoredListeners = new Set<() => void>();
   const log: string[] = [];
   let loadListener: (() => void) | undefined;
   let bounds: BBox = options.bounds ?? [-180, -90, 180, 90];
@@ -88,11 +96,19 @@ function createFakeMap(
     once(_type, listener) {
       loadListener = listener;
     },
-    on(_type, listener) {
-      moveEndListeners.add(listener);
+    on(type, listener) {
+      if (type === "webglcontextrestored") {
+        contextRestoredListeners.add(listener);
+      } else {
+        moveEndListeners.add(listener);
+      }
     },
-    off(_type, listener) {
-      moveEndListeners.delete(listener);
+    off(type, listener) {
+      if (type === "webglcontextrestored") {
+        contextRestoredListeners.delete(listener);
+      } else {
+        moveEndListeners.delete(listener);
+      }
     },
     getBounds: () => ({
       getWest: () => bounds[0],
@@ -103,6 +119,10 @@ function createFakeMap(
     project: (coordinate) => {
       const scale = options.pixelsPerDegree ?? 1;
       return { x: coordinate[0] * scale, y: coordinate[1] * scale };
+    },
+    getProjection: () => ({ name: options.projection ?? "mercator" }),
+    triggerRepaint() {
+      log.push("triggerRepaint");
     },
     fitBounds(b, o) {
       log.push(`fitBounds ${JSON.stringify(b)} ${JSON.stringify(o)}`);
@@ -115,6 +135,7 @@ function createFakeMap(
     layers,
     log,
     moveEndListeners,
+    contextRestoredListeners,
     fireLoad: () => loadListener?.(),
     moveTo(next: BBox) {
       bounds = next;
@@ -123,6 +144,109 @@ function createFakeMap(
       }
     },
   };
+}
+
+/** Create a WebGL context double sufficient to exercise custom-layer lifecycle. */
+function createFakeWebGLContext() {
+  let drawCalls = 0;
+  const shaderSources: string[] = [];
+  const context = {
+    VERTEX_SHADER: 1,
+    FRAGMENT_SHADER: 2,
+    COMPILE_STATUS: 3,
+    LINK_STATUS: 4,
+    ARRAY_BUFFER: 5,
+    STATIC_DRAW: 6,
+    CURRENT_PROGRAM: 7,
+    ARRAY_BUFFER_BINDING: 8,
+    BLEND: 9,
+    DEPTH_TEST: 10,
+    BLEND_SRC_RGB: 11,
+    BLEND_DST_RGB: 12,
+    BLEND_SRC_ALPHA: 13,
+    BLEND_DST_ALPHA: 14,
+    BLEND_EQUATION_RGB: 15,
+    BLEND_EQUATION_ALPHA: 16,
+    DEPTH_WRITEMASK: 17,
+    VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: 18,
+    VERTEX_ATTRIB_ARRAY_ENABLED: 19,
+    VERTEX_ATTRIB_ARRAY_SIZE: 20,
+    VERTEX_ATTRIB_ARRAY_TYPE: 21,
+    VERTEX_ATTRIB_ARRAY_NORMALIZED: 22,
+    VERTEX_ATTRIB_ARRAY_STRIDE: 23,
+    VERTEX_ATTRIB_ARRAY_POINTER: 24,
+    FLOAT: 25,
+    FUNC_ADD: 26,
+    SRC_ALPHA: 27,
+    ONE_MINUS_SRC_ALPHA: 28,
+    ONE: 29,
+    TRIANGLE_STRIP: 30,
+    VERSION: 31,
+    TRIANGLES: 32,
+    VIEWPORT: 33,
+    createShader: () => ({}),
+    shaderSource(_shader: object, source: string) {
+      shaderSources.push(source);
+    },
+    compileShader() {},
+    getShaderParameter: () => true,
+    getShaderInfoLog: () => null,
+    deleteShader() {},
+    createProgram: () => ({}),
+    attachShader() {},
+    linkProgram() {},
+    getProgramParameter: () => true,
+    getProgramInfoLog: () => null,
+    deleteProgram() {},
+    getAttribLocation: (_program: object, name: string) =>
+      name === "a_other" ? 1 : name === "a_side" ? 2 : 0,
+    getUniformLocation: () => ({}),
+    createBuffer: () => ({}),
+    bindBuffer() {},
+    bufferData() {},
+    deleteBuffer() {},
+    getVertexAttrib: (_index: number, parameter: number) => {
+      if (parameter === 20) {
+        return 2;
+      }
+      if (parameter === 21) {
+        return 25;
+      }
+      return parameter === 18 ? null : false;
+    },
+    getVertexAttribOffset: () => 0,
+    getParameter: (parameter: number) => {
+      if (parameter === 17) {
+        return true;
+      }
+      if (parameter === 31) {
+        return "WebGL 2.0 mock";
+      }
+      if (parameter === 33) {
+        return [0, 0, 800, 600];
+      }
+      return null;
+    },
+    isEnabled: () => false,
+    enable() {},
+    disable() {},
+    useProgram() {},
+    blendEquationSeparate() {},
+    blendFuncSeparate() {},
+    depthMask() {},
+    vertexAttribPointer() {},
+    enableVertexAttribArray() {},
+    disableVertexAttribArray() {},
+    uniformMatrix4fv() {},
+    uniform4f() {},
+    uniform2f() {},
+    uniform1i() {},
+    uniform1f() {},
+    drawArrays() {
+      drawCalls += 1;
+    },
+  };
+  return { context, drawCalls: () => drawCalls, shaderSources };
 }
 
 /**
@@ -441,6 +565,99 @@ test("tile-pixel helper derives Web Mercator pixel resolution", () => {
     }),
   );
   handle.remove();
+});
+
+test("shader bbox grid renders with a custom WebGL layer", () => {
+  const fake = createFakeMap({ projection: "mercator" });
+  const handle = addShaderBBoxGrid(fake.map, {
+    bbox: [-2, 50, 2, 54],
+    resolution: 0.1,
+    lineColor: "#0af",
+  });
+  assert.equal(handle.renderer, "webgl");
+  const rawLayer = fake.layers.get("bboxgrid");
+  assert.ok(rawLayer);
+  if (!rawLayer) {
+    throw new Error("custom shader layer missing");
+  }
+  const layer = rawLayer as unknown as {
+    type: string;
+    renderingMode: string;
+    onAdd(map: unknown, gl: unknown): void;
+    render(gl: unknown, matrix: number[]): void;
+    onRemove(map: unknown, gl: unknown): void;
+  };
+  assert.equal(layer.type, "custom");
+  assert.equal(layer.renderingMode, "2d");
+  const webgl = createFakeWebGLContext();
+  layer.onAdd(fake.map, webgl.context);
+  assert.ok(webgl.shaderSources.some((source) => source.startsWith("#version 300 es")));
+  assert.ok(webgl.shaderSources.some((source) => source.includes("out vec4 fragColor")));
+  layer.render(webgl.context, new Array(16).fill(0));
+  assert.equal(webgl.drawCalls(), 1);
+  assert.equal(fake.contextRestoredListeners.size, 1);
+  handle.update({ lineWidth: 2 });
+  assert.ok(fake.log.includes("triggerRepaint"));
+  handle.remove();
+  assert.equal(fake.layers.has("bboxgrid"), false);
+  assert.equal(fake.contextRestoredListeners.size, 0);
+  layer.onRemove(fake.map, webgl.context);
+});
+
+test("shader bbox grid falls back to GeoJSON for non-Mercator map projections", () => {
+  const fake = createFakeMap({ projection: "globe" });
+  const handle = addShaderBBoxGrid(fake.map, {
+    bbox: [-2, 50, 2, 54],
+    resolution: 1,
+  });
+  assert.equal(handle.renderer, "geojson");
+  assert.equal(fake.layers.get("bboxgrid")?.type, "line");
+  handle.remove();
+});
+
+test("shader projected grids support EPSG:3857 and arbitrary projected CRSs", () => {
+  const mercator = createFakeMap({ projection: "mercator" });
+  const shader = addShaderProjectedGrid(mercator.map, [-100_000, -100_000, 100_000, 100_000], {
+    crs: "EPSG:3857",
+    resolution: 10_000,
+  });
+  assert.equal(shader.renderer, "webgl");
+  assert.equal(mercator.layers.get("bboxgrid")?.type, "custom");
+  shader.remove();
+
+  const otherCrs = createFakeMap({ projection: "mercator" });
+  const fallback = addShaderProjectedGrid(otherCrs.map, [400_000, 100_000, 500_000, 200_000], {
+    crs: "EPSG:32631",
+    resolution: 20_000,
+  });
+  assert.equal(fallback.renderer, "webgl");
+  const rawLayer = otherCrs.layers.get("bboxgrid");
+  assert.equal(rawLayer?.type, "custom");
+  if (!rawLayer) {
+    throw new Error("custom projected shader layer missing");
+  }
+  const layer = rawLayer as unknown as {
+    onAdd(map: unknown, gl: unknown): void;
+    render(gl: unknown, matrix: number[]): void;
+    onRemove(map: unknown, gl: unknown): void;
+  };
+  const webgl = createFakeWebGLContext();
+  layer.onAdd(otherCrs.map, webgl.context);
+  assert.ok(webgl.shaderSources.some((source) => source.includes("a_other")));
+  layer.render(webgl.context, new Array(16).fill(0));
+  assert.equal(webgl.drawCalls(), 1);
+  fallback.remove();
+  layer.onRemove(otherCrs.map, webgl.context);
+
+  const nonMercator = createFakeMap({ projection: "globe" });
+  const mapFallback = addShaderProjectedGrid(
+    nonMercator.map,
+    [400_000, 100_000, 500_000, 200_000],
+    { crs: "EPSG:32631", resolution: 20_000 },
+  );
+  assert.equal(mapFallback.renderer, "geojson");
+  assert.equal(nonMercator.layers.get("bboxgrid")?.type, "line");
+  mapFallback.remove();
 });
 
 test("on-demand bbox vector tiles return MVT and remove cleanly", async () => {
